@@ -87,7 +87,6 @@ def menu_jobs(ctx: Context) -> None:
                 ("editar", "editar"),
                 ("apagar", "apagar"),
             ] + opcoes
-        opcoes.append(("voltar", "voltar"))
 
         try:
             escolha = prompt.escolhe("jobs", opcoes, rotulo_saida="voltar")
@@ -184,7 +183,6 @@ def menu_historico(ctx: Context) -> None:
                     ("job", "filtrar por job"),
                     ("falhas", "só falhas e pendências"),
                     ("limpar", "limpar filtros"),
-                    ("voltar", "voltar"),
                 ],
                 rotulo_saida="voltar",
             )
@@ -228,7 +226,6 @@ def menu_destinos(ctx: Context) -> None:
                 ("editar", "editar"),
                 ("apagar", "apagar"),
             ] + opcoes
-        opcoes.append(("voltar", "voltar"))
 
         try:
             escolha = prompt.escolhe("destinos", opcoes, rotulo_saida="voltar")
@@ -331,7 +328,7 @@ def menu_saude(ctx: Context) -> None:
     opcoes = []
     if not tick_installed():
         opcoes.append(("tick", "instalar o tick no crontab"))
-    opcoes += [("rever", "verificar de novo"), ("voltar", "voltar")]
+    opcoes.append(("rever", "verificar de novo"))
 
     try:
         escolha = prompt.escolhe("saúde", opcoes, rotulo_saida="voltar")
