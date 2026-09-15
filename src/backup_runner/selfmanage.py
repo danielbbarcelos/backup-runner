@@ -71,8 +71,16 @@ def _http_json(url: str, *, timeout: int = 10) -> dict:
         with urllib.request.urlopen(requisicao, timeout=timeout) as resposta:
             return json.loads(resposta.read().decode())
     except urllib.error.HTTPError as exc:
-        if exc.code == 404:
-            raise SelfError(f"não encontrado no GitHub: {url.rsplit('/', 1)[-1]}") from exc
+        # 422 é o que o GitHub devolve para um SHA que não existe, e 404 para
+        # tag ou release ausente. Para quem digitou a referência, os dois
+        # significam a mesma coisa.
+        if exc.code in (404, 422):
+            raise SelfError(f"não encontrado no repositório: {url.rsplit('/', 1)[-1]}") from exc
+        if exc.code == 403:
+            raise SelfError(
+                "o GitHub recusou (403), provavelmente limite de requisições.\n"
+                "tente de novo em alguns minutos, ou passe a tag exata em vez de latest"
+            ) from exc
         raise SelfError(f"o GitHub respondeu {exc.code}") from exc
     except urllib.error.URLError as exc:
         raise SelfError(f"sem acesso ao GitHub: {exc.reason}") from exc

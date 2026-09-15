@@ -61,25 +61,90 @@ alfabética coincide com a cronológica.
 ## Instalação
 
 ```sh
-./install.sh
-backup-runner install     # escreve o cron, gera o conf do supervisord
+pipx install "git+https://github.com/danielbbarcelos/backup-runner@latest"
+backup-runner install
 ```
 
-O `install` escreve no crontab do próprio usuário sozinho, porque isso não
-precisa de sudo. Para o supervisord ele gera o arquivo e imprime as linhas de
-sudo para você colar: o app nunca chama sudo por conta própria, já que
-instalar um serviço que roda para sempre merece ser lido antes.
+Se o `pipx` não estiver na máquina:
+
+```sh
+python3 -m pip install --user pipx && python3 -m pipx ensurepath
+```
+
+Depois de instalado, o programa se administra sozinho. `backup-runner self`
+resolve a referência antes de chamar o pipx, então uma tag errada falha ali
+mesmo, e não no meio de um clone.
+
+### Atualizar
+
+```sh
+backup-runner self reinstall --ref latest        # o último release publicado
+backup-runner self reinstall --ref v0.2.0        # uma versão específica
+backup-runner self reinstall --ref 37be30d1      # um commit do main
+backup-runner self reinstall --ref main          # a ponta do main, para testar
+```
+
+`latest` é o padrão, então `backup-runner self reinstall` sozinho já traz o
+último release. Para instalar de um clone durante o desenvolvimento:
+
+```sh
+backup-runner self reinstall --local ~/dev/labs/backup-runner
+```
+
+### Ver o que está instalado
+
+```sh
+backup-runner self status      # versão, de onde veio, e em que referência
+backup-runner self releases    # os releases publicados
+```
+
+A origem vem do metadata do próprio pipx, não de um arquivo de estado nosso,
+então continua certa mesmo se alguém rodar `pipx install` na mão.
+
+### Desinstalar
+
+```sh
+backup-runner self uninstall           # tira o programa, mantém jobs e histórico
+backup-runner self uninstall --purge   # tira tudo, inclusive config e dados
+```
+
+A remoção tira junto a linha do crontab, que ficaria órfã apontando para um
+binário que não existe mais. **Jobs, destinos, segredos e histórico ficam onde
+estão**, porque desinstalar o programa e apagar os backups agendados são
+decisões diferentes, e quem desinstala para reinstalar não quer perder o
+cadastro. O `--purge` apaga também, e pergunta antes.
+
+O worker do supervisord sai na mão, já que o programa não chama `sudo`:
+
+```sh
+sudo rm /etc/supervisor/conf.d/backup-runner.conf
+sudo supervisorctl reread && sudo supervisorctl update
+```
+
+### Agendamento
+
+O `backup-runner install` é outra coisa: ele não instala o programa, instala o
+**agendamento**. Escreve a linha no crontab do próprio usuário sozinho, porque
+isso não precisa de sudo, e gera o conf do supervisord para você aplicar. O
+programa nunca chama `sudo` por conta própria, já que instalar um serviço que
+roda para sempre merece ser lido antes.
 
 ## Comandos
 
-```
-backup-runner                 abre a interface
-backup-runner tick            decide o que entra na fila (o cron chama isto)
-backup-runner tick --install  escreve a linha no crontab
-backup-runner worker          consome a fila (ainda não implementado)
-backup-runner status          saúde do sistema, sem abrir a interface
-backup-runner demo            popula dados de demonstração
-```
+| Comando | O que faz |
+|---|---|
+| `backup-runner` | abre a interface |
+| `backup-runner status` | saúde do sistema, sem abrir a interface |
+| `backup-runner install` | escreve o cron e gera o conf do supervisord |
+| `backup-runner tick` | decide o que entra na fila (o cron chama isto) |
+| `backup-runner tick --install` | só a linha do crontab |
+| `backup-runner worker` | consome a fila (ainda não implementado) |
+| `backup-runner demo` | popula dados de demonstração |
+| `backup-runner self install` | instala o programa |
+| `backup-runner self reinstall` | troca de versão, com `--ref` |
+| `backup-runner self uninstall` | remove o programa |
+| `backup-runner self status` | de onde veio a instalação atual |
+| `backup-runner self releases` | releases publicados |
 
 ## Onde ficam as coisas
 
@@ -135,6 +200,12 @@ Para ver a interface com dados sem tocar na configuração real:
 export XDG_CONFIG_HOME=/tmp/br/config XDG_DATA_HOME=/tmp/br/data
 PYTHONPATH=src python3 -m backup_runner demo --yes
 PYTHONPATH=src python3 -m backup_runner
+```
+
+Para instalar o que está no clone, por cima da versão publicada:
+
+```sh
+backup-runner self reinstall --local .
 ```
 
 A interface veio de uma especificação visual feita no Claude Design, com
