@@ -210,3 +210,76 @@ def test_dashboard_vazio_ensina_os_passos(monkeypatch, tmp_path):
     assert "primeiro backup" in texto
     assert "três passos" in texto
     assert "tick" in texto
+
+
+# ----------------------------------------------------------------------------
+# Regressões de navegação e de área de transferência
+# ----------------------------------------------------------------------------
+
+def test_o_item_em_foco_tem_marca_visivel():
+    """O destaque não pode depender só de cor de fundo.
+
+    O bug original: o CSS mirava `.--highlight` e o Textual usa `-highlight`,
+    então não havia destaque nenhum, e o seletor errado falha em silêncio.
+    """
+    _, texto = tela([])
+    assert "› " in texto, "nenhuma marca de cursor na lista"
+
+    _, depois = tela(["down"])
+    assert texto != depois, "descer na lista não mudou nada na tela"
+
+
+def test_a_classe_de_destaque_do_textual_nao_mudou():
+    """Trava o nome da classe que o CSS depende.
+
+    Se uma versão nova do Textual renomear isto, o teste falha aqui em vez de
+    a interface ficar sem destaque sem ninguém perceber.
+    """
+    import asyncio
+
+    from backup_runner.ui.app import BackupRunnerApp
+    from backup_runner.ui.screens.dashboard import JobRow
+
+    async def _rodar():
+        app = BackupRunnerApp(skip_splash=True)
+        async with app.run_test(size=(100, 32)) as pilot:
+            await pilot.pause()
+            linhas = list(app.screen.query(JobRow))
+            destacadas = [l for l in linhas if l.highlighted]
+            assert len(destacadas) == 1, "deveria haver exatamente um item em foco"
+            assert destacadas[0].has_class("-highlight"), (
+                "o Textual mudou o nome da classe de destaque; o CSS precisa acompanhar"
+            )
+
+    asyncio.run(_rodar())
+
+
+def test_marca_de_foco_nas_tres_listas():
+    for tecla, tela_esperada in [("t", "DestinationsScreen"), ("s", "HealthScreen")]:
+        nome, texto = tela([tecla])
+        assert nome == tela_esperada
+        assert "› " in texto, f"sem marca de cursor em {tela_esperada}"
+
+
+def test_clipboard_nao_mente_sobre_o_resultado():
+    """Copiar precisa confirmar, não supor.
+
+    O bug original: o xclip continua vivo servindo a seleção, então capturar a
+    saída esperava até o timeout e a função reportava falha mesmo tendo
+    copiado. O contrário é pior ainda: dizer "copiado" sem ter copiado.
+    """
+    from backup_runner.clipboard import copy, disponivel
+
+    resultado = copy("backup-runner tick --install")
+    if disponivel():
+        assert resultado.ok, f"há ferramenta ({disponivel()}) e a cópia falhou: {resultado.erro}"
+        assert resultado.via
+    else:
+        assert not resultado.ok
+        assert resultado.sugestao, "sem ferramenta, precisa dizer como instalar"
+
+
+def test_clipboard_recusa_texto_vazio():
+    from backup_runner.clipboard import copy
+
+    assert not copy("").ok

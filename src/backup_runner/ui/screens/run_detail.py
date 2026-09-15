@@ -300,16 +300,19 @@ class RunDetailScreen(Screen):
         self.notify(f"{self.run.job} enfileirado do zero", severity="information")
 
     def action_copiar(self) -> None:
+        """Copia o que interessa na aba aberta: o erro, ou o caminho do artefato."""
         if self.run is None:
             return
-        texto = self.run.error_got or self.run.artifact or ""
+        if self.run.error_got and self.run.result in (RunResult.FAILED, RunResult.PENDING_UPLOAD):
+            texto, rotulo = self.run.error_got, "erro"
+        else:
+            texto, rotulo = (self.run.artifact or ""), "caminho"
         if not texto:
+            self.notify("não há o que copiar nesta execução", severity="warning")
             return
-        try:
-            self.app.copy_to_clipboard(texto)
-            self.notify("copiado", severity="information")
-        except Exception:
-            self.notify(texto, title="copie daqui", timeout=15)
+        from .health import _copiar
+
+        _copiar(self, texto, rotulo)
 
     def action_conferir(self) -> None:
         self.notify(

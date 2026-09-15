@@ -170,6 +170,18 @@ desacompanhado protege: se o worker consegue decifrar sozinho às três da
 manhã, qualquer coisa rodando na sua conta também consegue. Isso está
 registrado aqui para não haver ilusão depois.
 
+## Área de transferência
+
+As telas que oferecem `c copiar` usam, nesta ordem, `wl-copy`, `xclip`, `xsel`
+ou `pbcopy`, e conferem lendo de volta antes de dizer que copiaram. Sem
+nenhuma dessas ferramentas, o texto aparece numa notificação longa para você
+copiar com o mouse, junto com o comando que instala a que falta:
+
+```sh
+sudo apt install wl-clipboard   # Wayland
+sudo apt install xclip          # X11
+```
+
 ## Teclas
 
 | Tecla | O que faz |

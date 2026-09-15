@@ -30,19 +30,38 @@ from ..widgets.form import Choice, Field, Toggle
 TIPOS = [("local", "pasta"), ("s3", "s3"), ("sftp", "sftp")]
 
 
+class DestCell(Static):
+    def __init__(self, destino: Destination, **kwargs) -> None:
+        super().__init__(markup=True, **kwargs)
+        self.destino = destino
+
+    def render(self) -> str:
+        d = self.destino
+        pai = self.parent
+        foco = bool(getattr(pai, "highlighted", False))
+        marca = m.c(T.SYM_HINT, T.PRIMARY) if foco else " "
+        largura = max(20, self.size.width)
+        nome = m.body(d.name) if d.enabled else m.dim(d.name)
+        tipo = m.muted(d.kind.value) if d.enabled else m.dim(d.kind.value)
+        espaco = max(1, largura - 4 - len(d.name) - len(d.kind.value))
+        topo = f"{marca} {m.dot(d.enabled)} {nome}" + " " * espaco + tipo
+        resumo = d.summary() if d.enabled else t("dest.disabled")
+        if len(resumo) > largura - 5:
+            resumo = resumo[: largura - 6] + "…"
+        baixo = m.muted(resumo) if d.enabled else m.dim(resumo)
+        return f"{topo}\n     {baixo}"
+
+
 class DestRow(ListItem):
     def __init__(self, destino: Destination, **kwargs) -> None:
         super().__init__(**kwargs)
         self.destino = destino
 
     def compose(self) -> ComposeResult:
-        d = self.destino
-        nome = m.body(d.name) if d.enabled else m.dim(d.name)
-        tipo = m.muted(d.kind.value) if d.enabled else m.dim(d.kind.value)
-        espaco = max(1, 24 - len(d.name) - len(d.kind.value))
-        topo = f"{m.dot(d.enabled)} {nome}" + " " * espaco + tipo
-        baixo = m.muted(d.summary()) if d.enabled else m.dim(t("dest.disabled"))
-        yield Static(f"{topo}\n   {baixo}", markup=True)
+        yield DestCell(self.destino)
+
+    def refresh_row(self) -> None:
+        self.query_one(DestCell).refresh()
 
 
 class DestinationsScreen(Screen):
@@ -65,6 +84,7 @@ class DestinationsScreen(Screen):
         ("v", "revelar", "revelar"),
         ("ctrl+s", "salvar", "salvar"),
         ("ctrl+d", "apagar", "apagar"),
+        ("c", "copiar_conserto", "copiar conserto"),
         ("escape", "voltar", "voltar"),
         ("question_mark", "ajuda", "ajuda"),
     ]
@@ -134,8 +154,8 @@ class DestinationsScreen(Screen):
         barra.detail = t("dest.reachable", ok=sum(1 for d in destinos if d.enabled), total=len(destinos))
         barra.hints = m.keys(
             ("↑↓", t("key.move")), ("tab", t("key.field")), ("n", t("key.new_dest")),
-            ("^t", t("key.test")), ("v", t("key.reveal")), ("^s", t("key.save")),
-            ("^d", t("key.delete")), ("esc", t("key.back")),
+            ("^t", t("key.test")), ("v", t("key.reveal")), ("c", t("key.copy_cmd")),
+            ("^s", t("key.save")), ("^d", t("key.delete")), ("esc", t("key.back")),
         )
         barra.refresh()
 
@@ -260,6 +280,8 @@ class DestinationsScreen(Screen):
     # ------------------------------------------------------------------
     @on(ListView.Highlighted)
     async def _mudou_destino(self, evento: ListView.Highlighted) -> None:
+        for linha in self.query(DestRow):
+            linha.refresh_row()
         if isinstance(evento.item, DestRow):
             await self._carregar_form(evento.item.destino)
 
@@ -383,6 +405,19 @@ class DestinationsScreen(Screen):
         ctx.refresh()
         await self.refresh_data()
         self.notify(f"{nome} apagado", severity="information")
+
+    def action_copiar_conserto(self) -> None:
+        if self._resultado_teste is None:
+            self.notify("teste o destino primeiro", severity="warning")
+            return
+        _, _, extra = self._resultado_teste
+        conserto = extra.get("fix", "")
+        if not conserto:
+            self.notify("este teste não sugeriu comando", severity="warning")
+            return
+        from .health import _copiar
+
+        _copiar(self, conserto, "conserto")
 
     def action_voltar(self) -> None:
         self.app.ctx.refresh()  # type: ignore[attr-defined]

@@ -14,6 +14,7 @@ from textual.containers import VerticalScroll
 from textual.screen import Screen
 from textual.widgets import ListItem, ListView, Static
 
+from ...clipboard import copy as copiar_texto
 from ...health import HealthItem, Level, install_tick, summary, supervisor_conf
 from ...i18n import t
 from .. import markup as m
@@ -33,26 +34,38 @@ class HealthRow(ListItem):
         self.item = item
 
     def compose(self) -> ComposeResult:
-        yield Static(self._texto(), markup=True)
+        yield HealthCell(self.item)
 
-    def _texto(self) -> str:
+    def refresh_row(self) -> None:
+        self.query_one(HealthCell).refresh()
+
+
+class HealthCell(Static):
+    def __init__(self, item: HealthItem, **kwargs) -> None:
+        super().__init__(markup=True, **kwargs)
+        self.item = item
+
+    def render(self) -> str:
         item = self.item
+        pai = self.parent
+        foco = bool(getattr(pai, "highlighted", False))
+        marca = m.c(T.SYM_HINT, T.PRIMARY) if foco else " "
         simbolo, cor = SIMBOLOS[item.level]
         titulo = item.title.ljust(30)
-        linhas = [f"{m.c(simbolo, cor)} {m.body(titulo)}{m.muted(item.detail)}"]
+        linhas = [f"{marca} {m.c(simbolo, cor)} {m.body(titulo, bold=foco)}{m.muted(item.detail)}"]
         if item.why:
-            linhas.append("   " + m.muted(item.why))
+            linhas.append("     " + m.muted(item.why))
         for extra in item.extra:
-            linhas.append("   " + m.muted(extra))
+            linhas.append("     " + m.muted(extra))
         if item.progress is not None:
-            linhas.append("   " + m.bar(item.progress, 44))
+            linhas.append("     " + m.bar(item.progress, 44))
         if item.fix_command:
-            linhas.append("   " + m.secondary(t("health.fix").ljust(9)) + m.body(item.fix_command))
+            linhas.append("     " + m.secondary(t("health.fix").ljust(9)) + m.body(item.fix_command))
             teclas = []
             if item.fix_key:
                 teclas.append(m.key(item.fix_key, f" {t('key.fix')}"))
             teclas.append(m.key("c", f" {t('key.copy')}"))
-            linhas.append("             " + "     ".join(teclas))
+            linhas.append("               " + "     ".join(teclas))
         linhas.append("")
         return "\n".join(linhas)
 
@@ -119,6 +132,11 @@ class HealthScreen(Screen):
         item = self.query_one("#lista-saude", ListView).highlighted_child
         return item.item if isinstance(item, HealthRow) else None
 
+    @on(ListView.Highlighted)
+    def _mudou_item(self) -> None:
+        for linha in self.query(HealthRow):
+            linha.refresh_row()
+
     def action_mover(self, passo: int) -> None:
         lista = self.query_one("#lista-saude", ListView)
         lista.action_cursor_up() if passo < 0 else lista.action_cursor_down()
@@ -160,12 +178,9 @@ class HealthScreen(Screen):
     def action_copiar(self) -> None:
         item = self.item_atual
         if item is None or not item.fix_command:
+            self.notify("este item não tem comando de conserto", severity="warning")
             return
-        try:
-            self.app.copy_to_clipboard(item.fix_command)
-            self.notify("comando copiado", severity="information")
-        except Exception:
-            self.notify(item.fix_command, title="copie daqui", timeout=15)
+        _copiar(self, item.fix_command, "comando")
 
     def action_reverificar(self) -> None:
         self.refresh_data()
@@ -178,3 +193,22 @@ class HealthScreen(Screen):
         from .help import HelpScreen
 
         self.app.push_screen(HelpScreen(self.BINDINGS, t("screen.health")))
+
+
+def _copiar(tela, texto: str, rotulo: str) -> None:
+    """Copia e diz a verdade sobre o resultado.
+
+    Quando não há ferramenta na máquina, mostra o texto numa notificação longa
+    para a pessoa copiar com o mouse, junto com o comando que resolve de vez.
+    """
+    resultado = copiar_texto(texto, app=tela.app)
+    if resultado.ok:
+        tela.notify(f"{rotulo} copiado via {resultado.via}", severity="information")
+        return
+    tela.notify(
+        f"{texto}\n\n{resultado.erro}."
+        + (f"\ninstale com: {resultado.sugestao}" if resultado.sugestao else ""),
+        title="copie daqui com o mouse",
+        severity="warning",
+        timeout=30,
+    )

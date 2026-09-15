@@ -42,7 +42,16 @@ class JobCell(Static):
         self.view = view
 
     def render(self) -> str:
-        return _linha_job(self.view, max(24, self.size.width), self.app)
+        return _linha_job(self.view, max(24, self.size.width), self.app, self._em_foco())
+
+    def _em_foco(self) -> bool:
+        """A marca › vem do ListItem pai, que é quem o ListView marca.
+
+        Usa a propriedade `highlighted` e não a classe CSS: o Textual chama a
+        classe de `-highlight`, com um hífen só, e errar esse nome falha em
+        silêncio, sem destaque nenhum e sem erro.
+        """
+        return bool(getattr(self.parent, "highlighted", False))
 
 
 class JobRow(ListItem):
@@ -59,18 +68,23 @@ class JobRow(ListItem):
         self.query_one(JobCell).refresh()
 
 
-def _linha_job(v: JobView, largura: int, app) -> str:
+def _linha_job(v: JobView, largura: int, app, foco: bool = False) -> str:
     """Duas linhas por job: identidade em cima, estado embaixo.
 
     Duas linhas em vez de uma porque numa coluna de 40 células não cabe nome,
     tipo, resultado, tamanho e próxima execução sem abreviar justamente o nome,
     que é por onde a pessoa procura.
+
+    A marca › na coluna 1 é o que diz onde está o cursor. Fundo sozinho não
+    basta: num terminal com tema claro, ou com a lista fora de foco, a
+    diferença de cor some e a pessoa perde a posição.
     """
+    marca = m.c(T.SYM_HINT, T.PRIMARY) if foco else " "
     nome = m.body(v.name, bold=not v.paused) if not v.paused else m.dim(v.name)
     tipo_texto = v.kind_label
     tipo = m.muted(tipo_texto) if not v.paused else m.dim(tipo_texto)
-    espaco = max(1, largura - 2 - len(v.name) - len(tipo_texto))
-    topo = f"{m.dot(not v.paused)} {nome}" + " " * espaco + tipo
+    espaco = max(1, largura - 4 - len(v.name) - len(tipo_texto))
+    topo = f"{marca} {m.dot(not v.paused)} {nome}" + " " * espaco + tipo
 
     if v.running:
         baixo = m.badge(RunResult.RUNNING) + m.muted("  " + _estagio_atual(app))
@@ -99,7 +113,10 @@ def _linha_job(v: JobView, largura: int, app) -> str:
             f"próx. {_dia_hora(v.next_at)}" if proxima is not None else t("dash.no_next")
         )
         alerta = "  !" if v.is_stale() else ""
-        disponivel = largura - 3 - len(badge_texto) - len(alerta)
+        # A segunda linha começa na coluna 5 (marca, ponto e dois espaços),
+        # então o orçamento precisa descontar isso ou o alerta cai sozinho na
+        # linha seguinte.
+        disponivel = largura - 6 - len(badge_texto) - len(alerta)
 
         partes = [m.badge(v.last.result)]
         if tamanho_texto and len(tamanho_texto) + 2 <= disponivel - len(proxima_texto) - 2:
@@ -113,7 +130,7 @@ def _linha_job(v: JobView, largura: int, app) -> str:
         baixo = "  ".join(partes)
         if alerta:
             baixo += "  " + m.c(T.SYM_WARN, T.WARNING)
-    return f"{topo}\n   {baixo}"
+    return f"{topo}\n     {baixo}"
 
 
 def _estagio_atual(app) -> str:
@@ -550,6 +567,8 @@ class DashboardScreen(Screen):
     # ------------------------------------------------------------------
     @on(ListView.Highlighted)
     def _mudou_selecao(self) -> None:
+        for linha in self.query(JobRow):
+            linha.refresh_row()
         self._preencher_detalhe()
         self._preencher_status()
 

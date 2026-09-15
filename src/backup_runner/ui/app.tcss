@@ -71,12 +71,23 @@ ListView > ListItem {
     padding: 0 1;
 }
 
-ListView > ListItem.--highlight {
-    background: $br-surface;
+/* Destaque de seleção.
+
+   surface contra bg é uma diferença de luminosidade quase nula num terminal
+   real, então a linha selecionada usa o primary rebaixado, e a lista que tem
+   o foco do teclado destaca mais forte que a que só guarda a seleção. Quem
+   navega precisa enxergar onde está sem procurar. */
+
+ListView > ListItem.-highlight {
+    background: $br-primary 12%;
 }
 
-ListView:focus > ListItem.--highlight {
-    background: $br-surface;
+ListView:focus > ListItem.-highlight {
+    background: $br-primary 28%;
+}
+
+ListView:focus > ListItem.-highlight Static {
+    text-style: bold;
 }
 
 ListItem > Static {
