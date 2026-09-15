@@ -1,9 +1,13 @@
-"""Perguntas no terminal, com `input()`.
+"""Perguntas no terminal.
 
-Sem captura de tela e sem tecla de atalho: cada pergunta é uma linha, a
-resposta é o que a pessoa digita, e Enter aceita o padrão que está entre
-colchetes. É o que funciona por ssh ruim, dentro de `tmux`, num terminal que
-não entende sequência de escape, e é o que dá para ler depois no scrollback.
+Cada pergunta é uma linha, e a resposta é o que a pessoa digita. É o que
+funciona por ssh ruim, dentro de `tmux`, e num terminal que não entende
+sequência de escape.
+
+O campo tem edição de linha completa (setas para os lados, Home, End, Ctrl-A,
+Ctrl-E, Backspace, Delete), e o valor atual já vem preenchido e editável, em
+vez de ficar escondido atrás de um `[padrão]` que só o Enter aceita. Quem quer
+mudar uma porta de 3306 para 3307 muda um caractere.
 
 Ctrl-C e Ctrl-D cancelam em qualquer ponto, sempre com o mesmo efeito: nada é
 gravado, porque quem grava é o passo final de cada fluxo.
@@ -17,17 +21,40 @@ from typing import Callable, Sequence
 from . import console as c
 from . import keys
 
+# Importar readline é o que dá edição de linha ao input(). Sem ele, a seta para
+# a esquerda vira ^[[D literal dentro do texto digitado.
+try:
+    import readline
+except ImportError:  # pragma: no cover - Windows sem pyreadline
+    readline = None  # type: ignore[assignment]
+
 
 class Cancelado(Exception):
     """A pessoa desistiu (Ctrl-C, Ctrl-D, ou 'cancelar')."""
 
 
-def _ler(texto: str) -> str:
+def _ler(texto: str, *, preenchido: str = "") -> str:
+    """Lê uma linha, opcionalmente já com um valor dentro, pronto para editar."""
+    if readline is not None and preenchido:
+        def _preenche() -> None:
+            readline.insert_text(preenchido)
+            readline.redisplay()
+
+        readline.set_startup_hook(_preenche)
     try:
         return input(texto)
     except (KeyboardInterrupt, EOFError):
         print()
         raise Cancelado from None
+    finally:
+        if readline is not None:
+            readline.set_startup_hook(None)
+            # Cada campo começa limpo: subir a seta num campo de host não pode
+            # trazer o nome do job digitado duas perguntas atrás.
+            try:
+                readline.clear_history()
+            except AttributeError:
+                pass
 
 
 def texto(
@@ -37,10 +64,18 @@ def texto(
     obrigatorio: bool = False,
     valida: Callable[[str], str | None] | None = None,
 ) -> str:
-    """Campo de texto. `valida` devolve a mensagem de erro, ou None se está bom."""
-    sufixo = f" [{c.muted(padrao)}]" if padrao else ""
+    """Campo de texto. `valida` devolve a mensagem de erro, ou None se está bom.
+
+    Com readline, o valor atual entra já digitado e editável. Sem ele, cai no
+    velho `[padrão]` com Enter para aceitar.
+    """
+    edita = readline is not None and bool(padrao) and sys.stdin.isatty()
+    sufixo = "" if edita else (f" [{c.muted(padrao)}]" if padrao else "")
     while True:
-        resposta = _ler(f"  {c.secondary(pergunta)}{sufixo}: ").strip()
+        resposta = _ler(
+            f"  {c.secondary(pergunta)}{sufixo}: ",
+            preenchido=padrao if edita else "",
+        ).strip()
         if not resposta:
             resposta = padrao
         if obrigatorio and not resposta:
@@ -153,7 +188,7 @@ def _escolhe_setas(
                 foco = i
                 break
 
-    rodape = c.dim(
+    rodape = "\n" + c.dim(
         f"   ↑↓ navega   enter escolhe   esc {rotulo_saida}"
         if permitir_cancelar
         else "   ↑↓ navega   enter escolhe"
@@ -204,7 +239,7 @@ def _escolhe_setas(
                 continue
 
             # Redesenha só o bloco das opções, para não piscar a tela inteira.
-            keys.sobe(len(linhas) + 1)
+            keys.sobe(len(linhas) + 2)
             linhas = _linhas_opcoes(
                 opcoes, foco, permitir_cancelar=permitir_cancelar, rotulo_saida=rotulo_saida,
             )
@@ -293,7 +328,7 @@ def _marca_setas(
 ) -> list[str]:
     escolhidos = set(marcados)
     foco = 0
-    rodape = c.dim("   ↑↓ navega   espaço marca   a todos   n nenhum   enter confirma")
+    rodape = "\n" + c.dim("   ↑↓ navega   espaço marca   a todos   n nenhum   enter confirma")
 
     print()
     print(f"  {c.secondary(pergunta)}")
@@ -329,7 +364,7 @@ def _marca_setas(
             else:
                 continue
 
-            keys.sobe(len(linhas) + 1)
+            keys.sobe(len(linhas) + 2)
             linhas = _linhas_marcacao(opcoes, escolhidos, foco)
             for linha in linhas:
                 print("\033[2K" + linha)

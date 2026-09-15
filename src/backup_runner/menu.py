@@ -48,7 +48,6 @@ def principal(ctx: Context) -> int:
                     ("dest", "destinos       listar, criar, testar"),
                     ("avisos", "avisos         quais eventos notificam"),
                     ("saude", "saúde          tick, worker, chave, espaço"),
-                    ("sair", "sair"),
                 ],
                 permitir_cancelar=True,
                 rotulo_saida="sair",

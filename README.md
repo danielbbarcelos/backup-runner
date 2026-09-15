@@ -177,6 +177,10 @@ tabelas a ignorar), `espaço` marca, `a` marca todos e `n` limpa.
 Cada tela limpa e redesenha o mesmo cabeçalho com a trilha de onde se está, em
 vez de empilhar saída no scrollback.
 
+Nos campos de texto, o valor atual vem já preenchido e editável: as setas
+laterais andam com o cursor, `Home` e `End` vão às pontas, e trocar uma porta
+de 3306 para 3307 é mudar um caractere, não redigitar tudo.
+
 Fora de um terminal (num pipe, num cron, num teste) nada disso existe, e a
 escolha volta a ser por número. `BACKUP_RUNNER_SEM_SETAS=1` força esse modo.
 

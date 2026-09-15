@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "backup-runner"
-version = "0.3.3"
+version = "0.3.4"
 description = "Backup agendado de bancos MySQL e diretórios, com destinos local, S3 e SFTP"
 readme = "README.md"
 requires-python = ">=3.10"

@@ -463,3 +463,81 @@ def test_limpa_tela_nao_suja_pipe():
     with redirect_stdout(saida):
         console.limpa()
     assert saida.getvalue() == ""
+
+
+# ----------------------------------------------------------------------------
+# Edição de linha e rodapé
+# ----------------------------------------------------------------------------
+
+def test_readline_esta_carregado():
+    """Sem readline, a seta para a esquerda vira ^[[D dentro do texto."""
+    from backup_runner import prompt
+
+    assert prompt.readline is not None
+
+
+def test_valor_atual_vem_preenchido_e_editavel():
+    """Editar 3306 para 3307 deve ser mudar um caractere, não redigitar tudo."""
+    import os
+    import pty
+    import time
+
+    codigo = (
+        "import sys; sys.path.insert(0, %r);"
+        "from backup_runner import prompt;"
+        "print('R:', prompt.texto('porta', padrao='3306'), flush=True)"
+    ) % os.path.join(os.getcwd(), "src")
+
+    pid, fd = pty.fork()
+    if pid == 0:
+        os.execv(sys.executable, [sys.executable, "-c", codigo])
+
+    time.sleep(0.9)
+    os.write(fd, b"\x1b[D")   # seta para a esquerda: cursor entre o 0 e o 6
+    time.sleep(0.2)
+    os.write(fd, b"\x7f")     # backspace apaga o 0
+    time.sleep(0.2)
+    os.write(fd, b"7\r")      # digita 7 e confirma
+
+    saida = b""
+    fim = time.time() + 3
+    while time.time() < fim:
+        try:
+            pedaco = os.read(fd, 1024)
+        except OSError:
+            break
+        if not pedaco:
+            break
+        saida += pedaco
+        if b"R:" in saida:
+            break
+    try:
+        os.waitpid(pid, os.WNOHANG)
+    except ChildProcessError:
+        pass
+
+    texto = saida.decode(errors="replace")
+    assert "R: 3376" in texto, f"a edição no meio da linha não funcionou: {texto!r}"
+
+
+def test_menu_nao_repete_a_opcao_de_saida():
+    """O item da lista e o rótulo do esc mostravam a mesma palavra duas vezes."""
+    import inspect
+
+    from backup_runner import menu
+
+    fonte = inspect.getsource(menu)
+    # O menu principal e os submenus usam rotulo_saida; nenhum deles deve
+    # também carregar o item na lista.
+    assert '("sair", "sair")' not in fonte
+    assert '("voltar", "voltar")' not in fonte
+
+
+def test_rodape_tem_respiro_antes_das_teclas():
+    from backup_runner import prompt
+
+    linhas = prompt._linhas_opcoes(
+        [("a", "primeira"), ("b", "segunda")], 0, permitir_cancelar=True, rotulo_saida="voltar",
+    )
+    assert len(linhas) == 3  # duas opções mais a saída
+    assert "→" in linhas[0]
