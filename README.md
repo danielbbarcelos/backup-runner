@@ -12,11 +12,12 @@ nunca importado: uma mudança lá não pode quebrar um backup agendado aqui.
 
 ## Estado
 
-A interface, o modelo de dados, o agendador (`tick`) e a instalação funcionam.
-**O worker ainda não existe**: a camada que de fato dumpa, compacta, envia e
-avisa é a próxima frente. `backup-runner worker` sai com erro explícito em vez
-de fingir que está de pé, para o supervisord mostrar o programa em FATAL e a
-tela de saúde não mentir.
+Funcionando de ponta a ponta: cadastra, agenda, dumpa, compacta, envia, aplica
+retenção e avisa. Os três destinos (pasta, S3 compatível, SFTP) estão
+implementados, assim como email por SMTP e Slack por webhook.
+
+O que falta: verificação de hash lendo de volta do destino remoto, e um
+comando para trazer uma execução de volta.
 
 ## Como funciona
 
@@ -40,6 +41,17 @@ Cada job tem uma janela de tolerância (padrão 6h). Dentro dela, uma janela
 atrasada ainda roda, marcada como atrasada. Fora, é registrada como perdida e
 o aviso sai: um backup de sábado tirado na segunda é só mais uma cópia de
 segunda, não o dado de sábado.
+
+### Compressão
+
+Sempre, e em fluxo. O `mysqldump` escreve direto no gzip, então o SQL cru nunca
+toca o disco: um dump que termina com 2 GB não precisa de 5 GB livres no
+caminho. O mesmo vale para diretórios, com `tar.gz` em modo de fluxo.
+
+O preço do fluxo é que o código de saída do `mysqldump` não aparece sozinho:
+quem escreve o arquivo é o gzip, que termina feliz mesmo se a origem morreu no
+meio. Os dois lados são verificados, e um dump interrompido vira erro em vez de
+um `.gz` pela metade que ninguém percebe até precisar dele.
 
 ### Retenção
 

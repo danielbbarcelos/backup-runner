@@ -228,16 +228,17 @@ def match_pattern(tables: Iterable[str], pattern: str) -> list[str]:
 
 
 # ----------------------------------------------------------------------------
-# Dump execution
+# Execução do dump
 # ----------------------------------------------------------------------------
 
 @dataclass
 class DumpRequest:
     connection: Connection
-    ignore_tables: list[str]  # tables whose DATA we skip (structure kept)
-    output_file: Path
+    ignore_tables: list[str]   # tabelas cujos DADOS são pulados; a estrutura vai
+    output_file: Path          # sem o .gz: a compressão acrescenta a extensão
     log_file: Path | None
-    compress: bool = False
+    compress: bool = True
+    compress_level: int = 6
 
 
 @dataclass
@@ -247,6 +248,166 @@ class DumpResult:
     output_file: Path
     log_file: Path | None
     bytes_written: int
+    bytes_raw: int = 0         # quanto o mysqldump produziu antes de comprimir
+
+    @property
+    def ratio(self) -> float:
+        if not self.bytes_raw:
+            return 0.0
+        return 1 - (self.bytes_written / self.bytes_raw)
+
+
+def run_dump(
+    request: DumpRequest,
+    *,
+    on_progress: Callable[[int], None] | None = None,
+    on_phase: Callable[[str], None] | None = None,
+) -> DumpResult:
+    """Roda o mysqldump em duas passadas, comprimindo em fluxo.
+
+    As duas passadas vêm do mysql-dumper: primeiro os dados com `--ignore-table`
+    para as pesadas, depois só a estrutura das ignoradas. O arquivo final é
+    restaurável mesmo sem os dados que foram deixados de fora.
+
+    A compressão acontece no caminho, e não depois. Comprimir no fim exigiria
+    espaço para o arquivo cru inteiro (num caso real, cinco gigabytes para
+    chegar em dois), e o staging tem teto. Aqui o SQL cru nunca toca o disco.
+
+    O preço do fluxo é que o código de saída do mysqldump não aparece sozinho:
+    quem escreve o arquivo é o gzip, que termina feliz mesmo se a origem morreu
+    no meio. Por isso os dois lados são verificados, e um dump interrompido vira
+    erro em vez de um .gz pela metade que ninguém percebe até precisar dele.
+    """
+    require_binary("mysqldump")
+    conn = request.connection
+    defaults = _write_defaults_file(conn)
+
+    destino = request.output_file
+    if request.compress and destino.suffix != ".gz":
+        destino = destino.with_suffix(destino.suffix + ".gz")
+    destino.parent.mkdir(parents=True, exist_ok=True)
+
+    contagem = {"cru": 0}
+    stop_event = threading.Event()
+    watcher: threading.Thread | None = None
+    if on_progress is not None:
+        watcher = threading.Thread(
+            target=_stream_size_watcher,
+            args=(destino, stop_event, on_progress),
+            daemon=True,
+        )
+        watcher.start()
+
+    inicio = time.monotonic()
+    try:
+        log_cm = request.log_file.open("a") if request.log_file else contextlib.nullcontext(None)
+        with log_cm as log:
+            abrir = _abre_saida(destino, request)
+            with abrir as saida:
+                if on_phase:
+                    on_phase("dump")
+                _passada(_args_dados(defaults, conn, request.ignore_tables), saida, log, contagem)
+
+                if request.ignore_tables:
+                    if on_phase:
+                        on_phase("structure")
+                    _passada(
+                        _args_estrutura(defaults, conn, request.ignore_tables),
+                        saida, log, contagem,
+                    )
+    finally:
+        stop_event.set()
+        if watcher is not None:
+            watcher.join(timeout=1)
+        try:
+            defaults.unlink()
+        except OSError:
+            pass
+
+    return DumpResult(
+        returncode=0,
+        elapsed_seconds=time.monotonic() - inicio,
+        output_file=destino,
+        log_file=request.log_file,
+        bytes_written=destino.stat().st_size if destino.exists() else 0,
+        bytes_raw=contagem["cru"],
+    )
+
+
+def _abre_saida(destino: Path, request: DumpRequest):
+    """Arquivo de saída, comprimido ou não, aberto em binário."""
+    if request.compress:
+        import gzip
+
+        return gzip.open(destino, "wb", compresslevel=request.compress_level)
+    return destino.open("wb")
+
+
+def _args_dados(defaults: Path, conn: Connection, ignoradas: list[str]) -> list[str]:
+    args = [
+        "mysqldump",
+        f"--defaults-file={defaults}",
+        "--single-transaction",
+        "--quick",
+        "--skip-lock-tables",
+        "--no-tablespaces",
+    ]
+    for tabela in ignoradas:
+        args.append(f"--ignore-table={conn.database}.{tabela}")
+    args.append(conn.database)
+    return args
+
+
+def _args_estrutura(defaults: Path, conn: Connection, ignoradas: list[str]) -> list[str]:
+    return [
+        "mysqldump",
+        f"--defaults-file={defaults}",
+        "--no-data",
+        "--no-tablespaces",
+        conn.database,
+        *ignoradas,
+    ]
+
+
+def _passada(args: list[str], saida, log, contagem: dict) -> None:
+    """Uma chamada do mysqldump, escrita em fluxo no arquivo de saída.
+
+    Lê em blocos de 1 MB e escreve direto: o processo do mysqldump nunca precisa
+    caber na memória, e nem o SQL cru precisa caber no disco.
+    """
+    if log is not None:
+        log.write(f"\n$ {' '.join(_shell_quote(a) for a in args)}\n")
+        log.flush()
+
+    proc = subprocess.Popen(
+        args,
+        stdout=subprocess.PIPE,
+        stderr=(log if log is not None else subprocess.DEVNULL),
+        bufsize=0,
+    )
+    try:
+        assert proc.stdout is not None
+        while True:
+            bloco = proc.stdout.read(1024 * 1024)
+            if not bloco:
+                break
+            contagem["cru"] += len(bloco)
+            saida.write(bloco)
+    except KeyboardInterrupt:
+        proc.send_signal(signal.SIGINT)
+        proc.wait(timeout=5)
+        raise
+    finally:
+        if proc.stdout is not None:
+            proc.stdout.close()
+
+    codigo = proc.wait()
+    if codigo != 0:
+        # O gzip terminaria feliz de qualquer jeito; quem reclama é este check.
+        raise MySQLError(
+            f"mysqldump saiu com {codigo}"
+            + (f", veja {log.name}" if log is not None and hasattr(log, "name") else "")
+        )
 
 
 def _stream_size_watcher(
@@ -263,141 +424,7 @@ def _stream_size_watcher(
         stop_event.wait(0.5)
 
 
-def run_dump(
-    request: DumpRequest,
-    *,
-    on_progress: Callable[[int], None] | None = None,
-    on_phase: Callable[[str], None] | None = None,
-) -> DumpResult:
-    """Run mysqldump in two passes: data (with ignores) + structure-only for ignored tables.
-
-    on_progress(bytes_written): called ~2Hz with current output file size.
-    on_phase(phase_name): called when transitioning between passes.
-    """
-    require_binary("mysqldump")
-    conn = request.connection
-    defaults = _write_defaults_file(conn)
-
-    # Ensure output dir exists.
-    request.output_file.parent.mkdir(parents=True, exist_ok=True)
-    # Truncate the output before starting.
-    request.output_file.write_text("")
-
-    stop_event = threading.Event()
-    watcher: threading.Thread | None = None
-    if on_progress is not None:
-        watcher = threading.Thread(
-            target=_stream_size_watcher,
-            args=(request.output_file, stop_event, on_progress),
-            daemon=True,
-        )
-        watcher.start()
-
-    start = time.monotonic()
-    returncode = 0
-    try:
-        if on_phase:
-            on_phase("data")
-
-        base_args = [
-            "mysqldump",
-            f"--defaults-file={defaults}",
-            "--single-transaction",
-            "--quick",
-            "--skip-lock-tables",
-            "--no-tablespaces",
-        ]
-        for tbl in request.ignore_tables:
-            base_args.append(f"--ignore-table={conn.database}.{tbl}")
-        base_args.append(conn.database)
-
-        log_cm = request.log_file.open("a") if request.log_file else contextlib.nullcontext(subprocess.DEVNULL)
-        with request.output_file.open("ab") as out, log_cm as log:
-            rc = _run_piped(base_args, out, log)
-            returncode = rc
-            if rc != 0:
-                raise MySQLError(f"mysqldump data pass failed (rc={rc})")
-
-            if request.ignore_tables:
-                if on_phase:
-                    on_phase("structure")
-                struct_args = [
-                    "mysqldump",
-                    f"--defaults-file={defaults}",
-                    "--no-data",
-                    "--no-tablespaces",
-                    conn.database,
-                    *request.ignore_tables,
-                ]
-                rc = _run_piped(struct_args, out, log)
-                returncode = rc
-                if rc != 0:
-                    raise MySQLError(f"mysqldump structure pass failed (rc={rc})")
-    finally:
-        stop_event.set()
-        if watcher is not None:
-            watcher.join(timeout=1)
-        try:
-            defaults.unlink()
-        except OSError:
-            pass
-
-    elapsed = time.monotonic() - start
-
-    # Optional gzip compression of the final file.
-    final_path = request.output_file
-    if request.compress:
-        if on_phase:
-            on_phase("compress")
-        gz_path = final_path.with_suffix(final_path.suffix + ".gz")
-        _gzip_file(final_path, gz_path)
-        final_path.unlink()
-        final_path = gz_path
-
-    return DumpResult(
-        returncode=returncode,
-        elapsed_seconds=elapsed,
-        output_file=final_path,
-        log_file=request.log_file,
-        bytes_written=final_path.stat().st_size if final_path.exists() else 0,
-    )
-
-
-def _run_piped(args: list[str], stdout_fp, log_fp) -> int:
-    """Run a subprocess, stream stdout to file, stderr to log file.
-
-    log_fp may be a writable file-like object or the `subprocess.DEVNULL`
-    sentinel when logging is disabled.
-
-    Returns the process exit code. SIGINT is propagated.
-    """
-    if hasattr(log_fp, "write"):
-        log_fp.write(f"\n$ {' '.join(_shell_quote(a) for a in args)}\n")
-        log_fp.flush()
-    proc = subprocess.Popen(
-        args,
-        stdout=stdout_fp,
-        stderr=log_fp,
-    )
-    try:
-        return proc.wait()
-    except KeyboardInterrupt:
-        proc.send_signal(signal.SIGINT)
-        try:
-            proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-        raise
-
-
 def _shell_quote(arg: str) -> str:
     if re.fullmatch(r"[A-Za-z0-9_./:=\-]+", arg):
         return arg
     return "'" + arg.replace("'", "'\\''") + "'"
-
-
-def _gzip_file(src: Path, dst: Path) -> None:
-    import gzip
-
-    with src.open("rb") as fin, gzip.open(dst, "wb", compresslevel=6) as fout:
-        shutil.copyfileobj(fin, fout, length=1024 * 1024)

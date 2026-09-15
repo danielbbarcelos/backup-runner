@@ -159,6 +159,14 @@ def key_info() -> dict[str, Any]:
 # ----------------------------------------------------------------------------
 
 class JobStore:
+    """Os jobs em disco.
+
+    Atenção: `JobStore()` nasce vazio, e o primeiro `put` grava só o que está
+    nele, apagando o resto do arquivo. Para acrescentar a algo que já existe,
+    use sempre `JobStore.load()`. O construtor vazio serve para recriar o
+    arquivo do zero, que é o que o `demo` faz.
+    """
+
     def __init__(self, jobs: dict[str, Job] | None = None) -> None:
         self.jobs: dict[str, Job] = jobs or {}
 
@@ -194,6 +202,12 @@ class JobStore:
 
 
 class DestinationStore:
+    """Os destinos em disco.
+
+    Mesma ressalva do JobStore: `DestinationStore()` começa vazio e o `put`
+    reescreve o arquivo inteiro. Para acrescentar, `DestinationStore.load()`.
+    """
+
     def __init__(self, destinations: dict[str, Destination] | None = None) -> None:
         self.destinations: dict[str, Destination] = destinations or {}
 

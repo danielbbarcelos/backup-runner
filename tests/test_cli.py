@@ -272,10 +272,44 @@ def test_tabela_alinha_pelo_conteudo_visivel():
         importlib.reload(console)
 
 
-def test_worker_sai_com_codigo_proprio():
-    """Sai com erro explícito em vez de fingir que está de pé."""
-    codigo, _ = roda("worker")
-    assert codigo == 3
+def test_worker_com_fila_vazia_sai_na_hora():
+    """`--uma-vez` existe para isto: rodar o que houver e sair.
+
+    Sem a flag o worker fica de pé esperando, que é o certo para o supervisord
+    e o errado para um teste.
+    """
+    codigo, _ = roda("worker", "--uma-vez")
+    assert codigo == 0
+
+
+def test_worker_processa_um_item_e_sai(tmp_path):
+    from backup_runner.config import DestinationStore, JobStore
+    from backup_runner.models import (
+        Destination, DestKind, FilesSource, Job, JobDestination, RunResult,
+    )
+    from backup_runner.state import State
+
+    origem = tmp_path / "dados"
+    origem.mkdir()
+    (origem / "arquivo.txt").write_text("conteúdo" * 100)
+
+    DestinationStore.load().put(Destination(
+        name="disco", kind=DestKind.LOCAL, path=str(tmp_path / "destino"),
+    ))
+    JobStore.load().put(Job(
+        name="teste", source=FilesSource(path=str(origem)),
+        destinations=[JobDestination("disco", 7)],
+    ))
+
+    assert roda("run", "teste")[0] == 0
+    assert roda("worker", "--uma-vez")[0] == 0
+
+    estado = State()
+    execucoes = estado.runs(job="teste")
+    estado.close()
+    assert len(execucoes) == 1
+    assert execucoes[0].result is RunResult.OK
+    assert (tmp_path / "destino" / "teste").exists()
 
 
 def test_help_lista_os_comandos():
@@ -541,3 +575,140 @@ def test_rodape_tem_respiro_antes_das_teclas():
     )
     assert len(linhas) == 3  # duas opções mais a saída
     assert "→" in linhas[0]
+
+
+# ----------------------------------------------------------------------------
+# Regressões da edição de campo
+# ----------------------------------------------------------------------------
+
+def _num_pty(codigo: str, teclas: list[bytes], espera: float = 0.9) -> str:
+    """Roda um trecho num terminal de verdade e devolve o que apareceu."""
+    import os
+    import pty
+    import re
+    import select
+    import time
+
+    pid, fd = pty.fork()
+    if pid == 0:
+        os.environ["FORCE_COLOR"] = "1"
+        os.execv(sys.executable, [sys.executable, "-c", codigo])
+
+    time.sleep(espera)
+    for t in teclas:
+        os.write(fd, t)
+        time.sleep(0.15)
+
+    saida = b""
+    fim = time.time() + 3
+    while time.time() < fim:
+        pronto, _, _ = select.select([fd], [], [], 0.2)
+        if not pronto:
+            continue
+        try:
+            pedaco = os.read(fd, 4096)
+        except OSError:
+            break
+        if not pedaco:
+            break
+        saida += pedaco
+        if b"FIM:" in saida:
+            break
+    try:
+        os.waitpid(pid, os.WNOHANG)
+    except ChildProcessError:
+        pass
+    return re.sub(r"\x1b\[[0-9;?]*[a-zA-Z]", "", saida.decode(errors="replace"))
+
+
+def test_campo_preenchido_nao_aparece_duas_vezes():
+    """O bug: chamar redisplay() no startup_hook desenhava a linha de novo.
+
+    Na tela de editar destino isso aparecia como `nome: X   nome: X`, com
+    todos os campos repetidos lado a lado.
+    """
+    import os
+
+    codigo = (
+        "import sys; sys.path.insert(0, %r);"
+        "from backup_runner import prompt;"
+        "v = prompt.texto('nome', padrao='Peer Saude Backups');"
+        "print('FIM:', v, flush=True)"
+    ) % os.path.join(os.getcwd(), "src")
+
+    texto = _num_pty(codigo, [b"\r"])
+    antes_do_fim = texto.split("FIM:")[0]
+    assert antes_do_fim.count("Peer Saude Backups") == 1, (
+        f"o campo apareceu {antes_do_fim.count('Peer Saude Backups')} vezes:\n{antes_do_fim}"
+    )
+
+
+def test_senha_mostra_mascara_e_aceita_backspace():
+    """Sem eco nenhum não dá para saber se o teclado está funcionando."""
+    import os
+
+    codigo = (
+        "import sys; sys.path.insert(0, %r);"
+        "from backup_runner import prompt;"
+        "s = prompt.senha('secret');"
+        "print('FIM:', s, flush=True)"
+    ) % os.path.join(os.getcwd(), "src")
+
+    texto = _num_pty(codigo, [b"s3cr", b"\x7f", b"et", b"\r"])
+    assert "•" in texto, "a senha não mostrou máscara"
+    assert "FIM: s3cet" in texto, f"o backspace não apagou no lugar certo: {texto!r}"
+    assert "FIM: s3cret" not in texto
+
+
+def test_seta_para_na_ponta_em_vez_de_dar_a_volta():
+    """Dar a volta rolava a tela inteira e piscava."""
+    import os
+
+    codigo = (
+        "import sys; sys.path.insert(0, %r);"
+        "from backup_runner import prompt;"
+        "v = prompt.escolhe('qual', [('a','primeira'),('b','segunda')], permitir_cancelar=False);"
+        "print('FIM:', v, flush=True)"
+    ) % os.path.join(os.getcwd(), "src")
+
+    # Cinco vezes para baixo numa lista de dois: precisa parar na segunda.
+    texto = _num_pty(codigo, [b"\x1b[B"] * 5 + [b"\r"])
+    assert "FIM: b" in texto
+
+    # E cinco para cima precisa parar na primeira, sem passar para o fim.
+    texto = _num_pty(codigo, [b"\x1b[A"] * 5 + [b"\r"])
+    assert "FIM: a" in texto
+
+
+def test_modo_cru_e_reentrante():
+    """Abrir e fechar a cada tecla perdia o que já estava digitado."""
+    from backup_runner import keys
+
+    assert hasattr(keys, "cru"), "falta o contexto que segura o modo cru"
+    assert keys._profundidade == 0, "o contador de profundidade não zerou"
+
+
+def test_existe_como_configurar_os_canais():
+    """Sem isto, a matriz de avisos aponta para canais que não existem."""
+    from backup_runner import forms
+    from backup_runner.__main__ import build_parser
+
+    assert hasattr(forms, "configura_smtp")
+    assert hasattr(forms, "configura_slack")
+
+    acoes = build_parser()._subparsers._group_actions[0].choices
+    assert "channels" in acoes
+    assert "notify-test" in acoes
+
+
+def test_canal_nao_configurado_nao_avisa_ninguem():
+    """Marcar um evento num canal sem configuração não pode fingir que avisa."""
+    from backup_runner.config import Settings
+    from backup_runner.models import Channel, Job, MySQLSource, NotifyEvent
+
+    settings = Settings()
+    assert settings.channel_configured("email") is False
+    assert settings.channel_configured("slack") is False
+
+    settings.smtp = {"host": "smtp.exemplo.com", "to": "eu@exemplo.com"}
+    assert settings.channel_configured("email") is True

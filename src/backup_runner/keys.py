@@ -10,6 +10,7 @@ continua valendo como caminho principal.
 """
 from __future__ import annotations
 
+import contextlib
 import os
 import select
 import sys
@@ -55,6 +56,37 @@ def disponivel() -> bool:
     return True
 
 
+_profundidade = 0
+_estado_anterior = None
+
+
+@contextlib.contextmanager
+def cru():
+    """Mantém o terminal em modo cru enquanto o bloco roda.
+
+    Entrar e sair a cada tecla parece inofensivo e não é: entre uma leitura e
+    outra o terminal volta ao modo de linha, e o que já estava digitado se
+    perde. Quem lê várias teclas seguidas (uma senha, um menu) abre isto uma
+    vez e lê dentro.
+    """
+    global _profundidade, _estado_anterior
+    import termios
+    import tty
+
+    fd = sys.stdin.fileno()
+    if _profundidade == 0:
+        _estado_anterior = termios.tcgetattr(fd)
+        tty.setraw(fd)
+    _profundidade += 1
+    try:
+        yield fd
+    finally:
+        _profundidade -= 1
+        if _profundidade == 0 and _estado_anterior is not None:
+            termios.tcsetattr(fd, termios.TCSADRAIN, _estado_anterior)
+            _estado_anterior = None
+
+
 def ler() -> str:
     """Bloqueia até uma tecla, e devolve o nome dela ou o caractere digitado.
 
@@ -66,13 +98,7 @@ def ler() -> str:
     Ctrl-C vira KeyboardInterrupt como em qualquer programa, e Ctrl-D vira
     EOFError, para quem chama tratar como trataria num `input()`.
     """
-    import termios
-    import tty
-
-    fd = sys.stdin.fileno()
-    antes = termios.tcgetattr(fd)
-    try:
-        tty.setraw(fd)
+    with cru() as fd:
         ch = _byte(fd)
 
         if ch == "\x03":
@@ -100,9 +126,6 @@ def ler() -> str:
                 if sequencia[-1].isalpha() or sequencia[-1] == "~":
                     break
         return SEQUENCIAS.get(sequencia, ESC)
-    finally:
-        # Sempre devolve o terminal, inclusive se estourar no meio.
-        termios.tcsetattr(fd, termios.TCSADRAIN, antes)
 
 
 def _byte(fd: int) -> str:

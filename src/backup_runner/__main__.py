@@ -13,6 +13,7 @@ pelo menu: tudo é scriptável, e a saída é texto que `grep` filtra.
   backup-runner history          execuções
   backup-runner run-info <nº>    detalhe de uma execução
   backup-runner dest             destinos
+  backup-runner channels         configura SMTP e Slack
   backup-runner health           diagnóstico
   backup-runner tick             o que o cron chama
   backup-runner worker           o que o supervisord chama
@@ -122,7 +123,8 @@ def cmd_run(args: argparse.Namespace) -> int:
     ctx.state.enqueue(args.nome, dt.datetime.now())
     c.sucesso(f"{args.nome} entrou na fila")
     if not ctx.worker.running:
-        c.nota("o worker ainda não existe, então a fila acumula até ele entrar")
+        c.nota("o worker não está de pé, então a fila espera")
+        c.nota("para rodar agora mesmo: backup-runner worker --uma-vez")
     return 0
 
 
@@ -234,6 +236,30 @@ def cmd_notify(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_channels(args: argparse.Namespace) -> int:
+    from . import forms
+
+    ctx = _ctx()
+    if args.canal == "email":
+        forms.configura_smtp(ctx)
+    elif args.canal == "slack":
+        forms.configura_slack(ctx)
+    else:
+        forms.configura_canais(ctx)
+    return 0
+
+
+def cmd_notify_test(args: argparse.Namespace) -> int:
+    from . import notify
+
+    resultado = notify.teste(args.canal)
+    if resultado.ok:
+        c.sucesso(f"{resultado.canal} enviado para {resultado.detalhe}")
+        return 0
+    c.erro(f"{resultado.canal}: {resultado.detalhe}")
+    return 1
+
+
 def cmd_health(args: argparse.Namespace) -> int:
     from . import views
     from .health import Level
@@ -278,20 +304,12 @@ def cmd_tick(args: argparse.Namespace) -> int:
 
 
 def cmd_worker(args: argparse.Namespace) -> int:
-    """O worker ainda não existe.
+    """Consome a fila. É isto que o supervisord mantém de pé."""
+    from . import worker
 
-    Sair com erro explícito é melhor que um laço que não faz nada: assim o
-    supervisord mostra o programa em FATAL e o diagnóstico não mente dizendo
-    que o backup está de pé.
-    """
-    print(
-        "o worker ainda não foi implementado.\n"
-        "a fila, o agendador e a interface funcionam; falta a camada de execução\n"
-        "(dump, compressão, envio e aviso). Enquanto isso a fila acumula, e\n"
-        "`backup-runner status` mostra o que está esperando.",
-        file=sys.stderr,
-    )
-    return 3
+    if args.uma_vez:
+        c.info("processando um item da fila, se houver")
+    return worker.run_forever(intervalo=args.intervalo, uma_vez=args.uma_vez)
 
 
 def cmd_install(args: argparse.Namespace) -> int:
@@ -528,6 +546,14 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("health", help="diagnóstico do sistema")
     s.set_defaults(func=cmd_health)
 
+    s = sub.add_parser("channels", help="configura SMTP e Slack")
+    s.add_argument("canal", nargs="?", choices=["email", "slack"], default=None)
+    s.set_defaults(func=cmd_channels)
+
+    s = sub.add_parser("notify-test", help="manda uma mensagem de teste")
+    s.add_argument("canal", choices=["email", "slack"])
+    s.set_defaults(func=cmd_notify_test)
+
     s = sub.add_parser("tick", help="decide o que entra na fila (o cron chama isto)")
     s.add_argument("--install", action="store_true")
     s.add_argument("--uninstall", action="store_true")
@@ -536,6 +562,10 @@ def build_parser() -> argparse.ArgumentParser:
     s.set_defaults(func=cmd_tick)
 
     s = sub.add_parser("worker", help="consome a fila (o supervisord chama isto)")
+    s.add_argument("--uma-vez", action="store_true", dest="uma_vez",
+                   help="processa um item e sai, em vez de ficar de pé")
+    s.add_argument("--intervalo", type=float, default=5.0,
+                   help="segundos entre consultas à fila")
     s.set_defaults(func=cmd_worker)
 
     s = sub.add_parser("install", help="instala o agendamento: cron e supervisord")

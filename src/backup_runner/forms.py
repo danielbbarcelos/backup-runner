@@ -12,7 +12,7 @@ from pathlib import Path
 
 from . import console as c
 from . import mysql, prompt
-from .config import encrypt
+from .config import decrypt, encrypt
 from .context import Context
 from .format import format_bytes, format_count, format_relative
 from .models import (
@@ -459,3 +459,121 @@ def testa_destino(destino: Destination) -> bool:
         c.linha("o que recebi", str(exc), largura_rotulo=16)
         c.linha("como consertar", f"confira as permissões de {caminho}", largura_rotulo=16)
         return False
+
+
+# ----------------------------------------------------------------------------
+# Canais de aviso
+# ----------------------------------------------------------------------------
+
+def configura_canais(ctx: Context) -> None:
+    """SMTP e Slack: sem isto, a matriz de avisos não tem por onde avisar."""
+    escolha = prompt.escolhe(
+        "qual canal",
+        [("email", "email por SMTP"), ("slack", "Slack por webhook")],
+        rotulo_saida="voltar",
+    )
+    if escolha == "email":
+        configura_smtp(ctx)
+    else:
+        configura_slack(ctx)
+
+
+def configura_smtp(ctx: Context) -> None:
+    from . import notify
+
+    smtp = dict(ctx.settings.smtp)
+    c.titulo("email por SMTP")
+
+    smtp["host"] = prompt.texto("servidor", padrao=smtp.get("host", ""), obrigatorio=True)
+    smtp["port"] = prompt.inteiro(
+        "porta", padrao=int(smtp.get("port", 587) or 587), minimo=1, maximo=65535,
+    )
+    c.nota("587 usa STARTTLS, 465 usa TLS direto; o programa escolhe pela porta")
+
+    smtp["user"] = prompt.texto("usuário", padrao=smtp.get("user", ""))
+    if smtp["user"]:
+        senha = prompt.senha("senha", manter=bool(smtp.get("password_enc")))
+        if senha:
+            smtp["password_enc"] = encrypt(senha)
+        c.nota("a senha é cifrada em disco, como as dos bancos e destinos")
+
+    smtp["from"] = prompt.texto(
+        "remetente", padrao=smtp.get("from") or smtp.get("user", ""), obrigatorio=True,
+    )
+    smtp["to"] = prompt.texto(
+        "enviar para", padrao=smtp.get("to", ""), obrigatorio=True,
+    )
+
+    ctx.settings.smtp = smtp
+    ctx.settings.save()
+    c.sucesso("SMTP salvo")
+
+    if prompt.confirma("mandar uma mensagem de teste agora", padrao=True):
+        resultado = notify.teste("email")
+        if resultado.ok:
+            c.sucesso(f"enviado para {resultado.detalhe}")
+        else:
+            c.erro("não enviou")
+            c.linha("o que recebi", resultado.detalhe, largura_rotulo=16)
+            c.linha("causa provável", _causa_smtp(resultado.detalhe), largura_rotulo=16)
+
+
+def _causa_smtp(erro: str) -> str:
+    texto = erro.lower()
+    if "authentication" in texto or "535" in texto:
+        return "usuário ou senha recusados pelo servidor"
+    if "name or service not known" in texto or "getaddrinfo" in texto:
+        return "o servidor não resolve; confira o nome"
+    if "timed out" in texto or "timeout" in texto:
+        return "o servidor não respondeu na porta informada"
+    if "starttls" in texto or "ssl" in texto:
+        return "descompasso de TLS; tente a outra porta (587 ou 465)"
+    return "resposta inesperada do servidor"
+
+
+def configura_slack(ctx: Context) -> None:
+    from . import notify
+
+    slack = dict(ctx.settings.slack)
+    c.titulo("Slack por webhook")
+    c.nota("crie em api.slack.com/apps → Incoming Webhooks → Add New Webhook")
+    c.nota("a URL aponta para um canal específico, escolhido lá")
+
+    atual = decrypt(slack.get("webhook_enc"))
+    if atual:
+        c.linha("webhook atual", "•" * 24 + f"  (termina em {atual[-6:]})")
+    url = prompt.senha("URL do webhook", manter=bool(atual))
+    if url:
+        if not url.startswith("https://hooks.slack.com/"):
+            c.aviso("a URL não parece um webhook do Slack")
+            if not prompt.confirma("usar mesmo assim", padrao=False):
+                return
+        slack["webhook_enc"] = encrypt(url)
+
+    slack["channel"] = prompt.texto(
+        "rótulo do canal, só para aparecer aqui",
+        padrao=slack.get("channel", "#backups"),
+    )
+
+    ctx.settings.slack = slack
+    ctx.settings.save()
+    c.sucesso("Slack salvo")
+
+    if prompt.confirma("mandar uma mensagem de teste agora", padrao=True):
+        resultado = notify.teste("slack")
+        if resultado.ok:
+            c.sucesso(f"enviado para {resultado.detalhe or 'o canal do webhook'}")
+        else:
+            c.erro("não enviou")
+            c.linha("o que recebi", resultado.detalhe, largura_rotulo=16)
+            c.linha("causa provável", _causa_slack(resultado.detalhe), largura_rotulo=16)
+
+
+def _causa_slack(erro: str) -> str:
+    if "404" in erro:
+        return "o webhook não existe mais, ou a URL está errada"
+    if "403" in erro:
+        return "o app perdeu acesso ao canal"
+    if "410" in erro:
+        return "o webhook foi revogado"
+    return "o Slack não aceitou a mensagem"

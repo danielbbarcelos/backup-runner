@@ -28,6 +28,21 @@ try:
 except ImportError:  # pragma: no cover - Windows sem pyreadline
     readline = None  # type: ignore[assignment]
 
+# O readline conta as colunas do prompt para saber onde o texto começa, e uma
+# sequência de cor tem zero largura na tela mas vários bytes na string. Sem
+# marcar o que é invisível, ele erra a conta e redesenha a linha deslocada,
+# que é o que fazia o campo aparecer duas vezes ao editar um destino.
+RL_INICIO = "\001"
+RL_FIM = "\002"
+_ESCAPE = __import__("re").compile(r"(\033\[[0-9;]*m)")
+
+
+def _prompt(texto: str) -> str:
+    """Marca as sequências invisíveis, para o readline medir o prompt certo."""
+    if readline is None:
+        return texto
+    return _ESCAPE.sub(lambda m: f"{RL_INICIO}{m.group(1)}{RL_FIM}", texto)
+
 
 class Cancelado(Exception):
     """A pessoa desistiu (Ctrl-C, Ctrl-D, ou 'cancelar')."""
@@ -36,13 +51,12 @@ class Cancelado(Exception):
 def _ler(texto: str, *, preenchido: str = "") -> str:
     """Lê uma linha, opcionalmente já com um valor dentro, pronto para editar."""
     if readline is not None and preenchido:
-        def _preenche() -> None:
-            readline.insert_text(preenchido)
-            readline.redisplay()
-
-        readline.set_startup_hook(_preenche)
+        # Só insere: o readline desenha a linha sozinho logo depois. Chamar
+        # redisplay() aqui faz ele desenhar duas vezes, e o campo aparece
+        # duplicado na tela.
+        readline.set_startup_hook(lambda: readline.insert_text(preenchido))
     try:
-        return input(texto)
+        return input(_prompt(texto))
     except (KeyboardInterrupt, EOFError):
         print()
         raise Cancelado from None
@@ -90,13 +104,55 @@ def texto(
 
 
 def senha(pergunta: str, *, manter: bool = False) -> str:
-    """Senha sem eco. Enter em branco mantém a atual, quando há uma."""
+    """Senha com máscara.
+
+    Cada tecla vira um ponto na tela. Sem eco nenhum, como faz o `getpass`, não
+    dá para saber se o teclado está funcionando, se o layout está certo, ou
+    quantos caracteres já entraram, e uma senha digitada errada só aparece
+    como erro de conexão dois passos depois.
+    """
     sufixo = c.muted(" [Enter mantém a atual]") if manter else ""
-    try:
-        return getpass.getpass(f"  {c.secondary(pergunta)}{sufixo}: ")
-    except (KeyboardInterrupt, EOFError):
-        print()
-        raise Cancelado from None
+    rotulo = f"  {c.secondary(pergunta)}{sufixo}: "
+
+    if not keys.disponivel():
+        # Sem terminal, o getpass é o que sobra: nada de eco, nada de máscara.
+        try:
+            return getpass.getpass(rotulo)
+        except (KeyboardInterrupt, EOFError):
+            print()
+            raise Cancelado from None
+
+    sys.stdout.write(rotulo)
+    sys.stdout.flush()
+    digitado: list[str] = []
+    # Um bloco cru só para o campo inteiro: abrir e fechar a cada tecla perde
+    # o que já foi digitado enquanto o terminal volta ao modo de linha.
+    with keys.cru():
+        while True:
+            try:
+                tecla = keys.ler()
+            except (KeyboardInterrupt, EOFError):
+                print()
+                raise Cancelado from None
+
+            if tecla == keys.ENTER:
+                print()
+                return "".join(digitado)
+            if tecla == keys.ESC:
+                print()
+                raise Cancelado
+            if tecla == keys.BACKSPACE:
+                if digitado:
+                    digitado.pop()
+                    # Apaga o último ponto da tela.
+                    sys.stdout.write("\b \b")
+                    sys.stdout.flush()
+                continue
+            if len(tecla) != 1 or not tecla.isprintable():
+                continue
+            digitado.append(tecla)
+            sys.stdout.write(c.muted("•"))
+            sys.stdout.flush()
 
 
 def inteiro(pergunta: str, *, padrao: int, minimo: int | None = None, maximo: int | None = None) -> int:
@@ -204,6 +260,7 @@ def _escolhe_setas(
 
     keys.esconde_cursor()
     try:
+      with keys.cru():
         while True:
             try:
                 tecla = keys.ler()
@@ -220,9 +277,15 @@ def _escolhe_setas(
                     raise Cancelado
                 continue
             if tecla == keys.CIMA:
-                foco = (foco - 1) % total
+                # Para na ponta em vez de dar a volta: o salto do topo para o
+                # fim rola a tela inteira e pisca, e a lista some de vista.
+                if foco == 0:
+                    continue
+                foco -= 1
             elif tecla == keys.BAIXO:
-                foco = (foco + 1) % total
+                if foco >= total - 1:
+                    continue
+                foco += 1
             elif tecla == keys.HOME:
                 foco = 0
             elif tecla == keys.FIM:
@@ -339,6 +402,7 @@ def _marca_setas(
 
     keys.esconde_cursor()
     try:
+      with keys.cru():
         while True:
             try:
                 tecla = keys.ler()
@@ -351,9 +415,13 @@ def _marca_setas(
             if tecla == keys.ESC:
                 raise Cancelado
             if tecla == keys.CIMA:
-                foco = (foco - 1) % len(opcoes)
+                if foco == 0:
+                    continue
+                foco -= 1
             elif tecla == keys.BAIXO:
-                foco = (foco + 1) % len(opcoes)
+                if foco >= len(opcoes) - 1:
+                    continue
+                foco += 1
             elif tecla == keys.ESPACO:
                 chave = opcoes[foco][0]
                 escolhidos.discard(chave) if chave in escolhidos else escolhidos.add(chave)

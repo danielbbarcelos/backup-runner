@@ -284,10 +284,29 @@ def menu_avisos(ctx: Context) -> None:
     alvo = prompt.escolhe(
         "avisos de quem",
         [("global", "o padrão global, que todo job herda")]
-        + [(v.name, f"o job {v.name}") for v in ctx.views],
+        + [(v.name, f"o job {v.name}") for v in ctx.views]
+        + [("canais", "configurar os canais (SMTP e Slack)")],
+        rotulo_saida="voltar",
     )
+    if alvo == "canais":
+        forms.configura_canais(ctx)
+        ctx.refresh()
+        prompt.pausa("Enter volta")
+        return
     job = None if alvo == "global" else ctx.jobs.get(alvo)
     views.matriz_avisos(ctx, job)
+
+    faltando = [
+        nome for nome in ("email", "slack")
+        if not ctx.settings.channel_configured(nome)
+    ]
+    if faltando:
+        c.aviso(f"sem configuração: {', '.join(faltando)}")
+        c.nota("um evento marcado num canal não configurado não avisa ninguém")
+        if prompt.confirma("configurar agora", padrao=True):
+            forms.configura_canais(ctx)
+            ctx.refresh()
+            return
 
     if not prompt.confirma("mudar algum aviso", padrao=False):
         return
@@ -358,4 +377,5 @@ def _hoje() -> str:
 
 def _avisa_sem_worker(ctx: Context) -> None:
     if not ctx.worker.running:
-        c.nota("o worker ainda não existe, então a fila acumula até ele entrar")
+        c.nota("o worker não está de pé, então a fila espera")
+        c.nota("para rodar agora: backup-runner worker --uma-vez")
