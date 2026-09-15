@@ -125,6 +125,7 @@ def senha(pergunta: str, *, manter: bool = False) -> str:
     sys.stdout.write(rotulo)
     sys.stdout.flush()
     digitado: list[str] = []
+    keys.mostra_cursor()
     # Um bloco cru só para o campo inteiro: abrir e fechar a cada tecla perde
     # o que já foi digitado enquanto o terminal volta ao modo de linha.
     with keys.cru():
@@ -214,14 +215,22 @@ def escolhe(
 def _desenha_bloco(linhas: list[str], *, redesenhando: bool) -> int:
     """Escreve o bloco de opções e devolve quantas linhas ocupou.
 
-    Ao redesenhar, cada linha começa com `\r` para voltar à coluna 0 e `\033[2K`
-    para apagar o que estava lá. Sem o `\r`, o cursor fica na coluna em que
-    parou e o texto novo sai deslocado por cima do antigo, que foi exatamente
-    o embaralhado que apareceu na tela.
+    Cada linha começa com `\r` para voltar à coluna 0 e `\033[2K` para apagar o
+    que estava lá. Sem o `\r`, o cursor fica na coluna em que parou e o texto
+    novo sai deslocado por cima do antigo.
+
+    No primeiro desenho o bloco é reservado antes: imprime as linhas vazias,
+    deixa a tela rolar se precisar, e só então volta ao topo. Sem isso, um
+    bloco que nasce coladinho no rodapé da tela faz o terminal rolar no meio do
+    desenho, e a partir daí `sobe()` aponta para um lugar que mudou de posição.
+    É o que embaralhava a tela de avisos, que é a mais alta do programa.
     """
-    prefixo = "\r\033[2K" if redesenhando else ""
+    if not redesenhando:
+        for _ in linhas:
+            print()
+        keys.sobe(len(linhas))
     for linha in linhas:
-        print(prefixo + linha)
+        print("\r\033[2K" + linha)
     return len(linhas)
 
 

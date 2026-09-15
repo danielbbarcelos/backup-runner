@@ -754,9 +754,206 @@ def test_altura_do_bloco_bate_com_o_que_foi_impresso():
     from backup_runner import prompt
 
     bloco = ["linha 1", "linha 2", "", "teclas"]
+
+    # No redesenho, uma linha impressa por linha do bloco.
+    saida = io.StringIO()
+    with redirect_stdout(saida):
+        altura = prompt._desenha_bloco(bloco, redesenhando=True)
+    assert altura == len(bloco)
+    assert saida.getvalue().count("\n") == altura
+
+    # No primeiro desenho vem a reserva antes: as linhas vazias que forçam o
+    # scroll acontecer agora, e não no meio do bloco.
     saida = io.StringIO()
     with redirect_stdout(saida):
         altura = prompt._desenha_bloco(bloco, redesenhando=False)
-
     assert altura == len(bloco)
-    assert saida.getvalue().count("\n") == altura
+    assert saida.getvalue().count("\n") == altura * 2
+
+
+def test_modo_de_leitura_preserva_a_quebra_de_linha_do_terminal():
+    """Regressão: `setraw` desliga o pós-processamento da saída.
+
+    Sem ele, um `\\n` desce uma linha e não volta para a coluna 0. O resultado
+    é a tela em escadinha e o prompt do shell aparecendo no meio da linha
+    depois que o programa sai. `setcbreak` desliga só o modo de linha e o eco.
+    """
+    import inspect
+
+    from backup_runner import keys
+
+    fonte = inspect.getsource(keys.cru)
+    assert "setcbreak" in fonte
+    assert "setraw" not in fonte.replace("`setraw`", ""), "voltou para o modo cru total"
+
+
+def test_saida_do_menu_deixa_o_cursor_na_coluna_zero():
+    """O prompt do shell precisa começar do começo da linha."""
+    import os
+    import pty
+    import select
+    import time
+
+    codigo = (
+        "import os, sys; sys.path.insert(0, %r);"
+        "os.environ['FORCE_COLOR'] = '1';"
+        "os.environ['XDG_CONFIG_HOME'] = %r;"
+        "os.environ['XDG_DATA_HOME'] = %r;"
+        "from backup_runner.context import Context;"
+        "from backup_runner import menu;"
+        "menu.principal(Context());"
+        "print('DEPOIS', flush=True)"
+    ) % (
+        os.path.join(os.getcwd(), "src"),
+        os.environ["XDG_CONFIG_HOME"],
+        os.environ["XDG_DATA_HOME"],
+    )
+
+    pid, fd = pty.fork()
+    if pid == 0:
+        os.execv(sys.executable, [sys.executable, "-c", codigo])
+
+    time.sleep(1.2)
+    for _ in range(6):          # desce até "sair"
+        os.write(fd, b"\x1b[B")
+        time.sleep(0.1)
+    os.write(fd, b"\r")
+
+    saida = b""
+    fim = time.time() + 3
+    while time.time() < fim:
+        if not select.select([fd], [], [], 0.2)[0]:
+            continue
+        try:
+            pedaco = os.read(fd, 4096)
+        except OSError:
+            break
+        if not pedaco:
+            break
+        saida += pedaco
+        if b"DEPOIS" in saida:
+            break
+    try:
+        os.waitpid(pid, os.WNOHANG)
+    except ChildProcessError:
+        pass
+
+    texto = saida.decode(errors="replace")
+    assert "DEPOIS" in texto, "o menu não terminou"
+    # O que vem depois do menu começa numa linha nova, não colado no rodapé.
+    antes_de_depois = texto[: texto.index("DEPOIS")]
+    assert antes_de_depois.endswith("\r\n"), repr(antes_de_depois[-30:])
+    assert "\x1b[?25h" in texto, "o cursor ficou escondido depois de sair"
+
+
+def test_tecla_sem_efeito_nao_escreve_nada():
+    """Na ponta da lista, a seta não pode redesenhar nem emitir sinal sonoro.
+
+    Redesenhar à toa pisca; um BEL vira flash em terminal com sino visual.
+    """
+    import os
+    import pty
+    import select
+    import time
+
+    codigo = (
+        "import sys; sys.path.insert(0, %r);"
+        "from backup_runner import prompt;"
+        "prompt.escolhe('e', [('a','alfa'),('b','bravo')], permitir_cancelar=False)"
+    ) % os.path.join(os.getcwd(), "src")
+
+    pid, fd = pty.fork()
+    if pid == 0:
+        os.execv(sys.executable, [sys.executable, "-c", codigo])
+
+    time.sleep(0.9)
+    while select.select([fd], [], [], 0.3)[0]:
+        os.read(fd, 4096)          # descarta o desenho inicial
+
+    os.write(fd, b"\x1b[B")        # vai para o último
+    time.sleep(0.3)
+    while select.select([fd], [], [], 0.3)[0]:
+        os.read(fd, 4096)
+
+    os.write(fd, b"\x1b[B")        # bate na ponta
+    time.sleep(0.4)
+    na_ponta = b""
+    while select.select([fd], [], [], 0.3)[0]:
+        na_ponta += os.read(fd, 4096)
+
+    try:
+        os.kill(pid, 9)
+        os.waitpid(pid, os.WNOHANG)
+    except (ChildProcessError, ProcessLookupError):
+        pass
+
+    assert na_ponta == b"", f"a tecla sem efeito escreveu {na_ponta!r}"
+    assert b"\a" not in na_ponta
+
+
+def test_bloco_colado_no_rodape_da_tela_nao_embaralha():
+    """Regressão da tela de avisos, que é a mais alta do programa.
+
+    Quando o bloco nasce coladinho no fim da tela, o terminal rola no meio do
+    desenho, e a partir daí `sobe()` aponta para um lugar que mudou de posição.
+    A correção é reservar o espaço antes: imprimir as linhas vazias, deixar a
+    tela rolar, e só então voltar ao topo.
+    """
+    import fcntl
+    import os
+    import pty
+    import re
+    import select
+    import struct
+    import termios
+    import time
+
+    codigo = (
+        "import sys; sys.path.insert(0, %r);"
+        "print('cabecalho\\n' * 16, end='');"      # empurra o bloco para o fim
+        "from backup_runner import prompt;"
+        "prompt.escolhe('qual evento', ["
+        "  ('a', 'sucesso'), ('b', 'falha'), ('c', 'recuperado'),"
+        "  ('d', 'janela perdida'), ('e', 'silencio longo'),"
+        "])"
+    ) % os.path.join(os.getcwd(), "src")
+
+    pid, fd = pty.fork()
+    if pid == 0:
+        os.environ["FORCE_COLOR"] = "1"
+        os.execv(sys.executable, [sys.executable, "-c", codigo])
+    # Tela baixa de propósito: o bloco não cabe sem rolar.
+    fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", 20, 90, 0, 0))
+
+    def drena(espera=0.4) -> bytes:
+        dados = b""
+        while select.select([fd], [], [], espera)[0]:
+            try:
+                pedaco = os.read(fd, 8192)
+            except OSError:
+                break
+            if not pedaco:
+                break
+            dados += pedaco
+        return dados
+
+    time.sleep(1.0)
+    drena()
+    os.write(fd, b"\x1b[B")
+    time.sleep(0.4)
+    depois = re.sub(r"\x1b\[[0-9;?]*[a-zA-Z]", "", drena().decode(errors="replace"))
+
+    try:
+        os.kill(pid, 9)
+        os.waitpid(pid, os.WNOHANG)
+    except (ChildProcessError, ProcessLookupError):
+        pass
+
+    linhas = [l for l in depois.splitlines() if l.strip()]
+    assert linhas, "o redesenho não escreveu nada"
+    for linha in linhas:
+        # Duas opções na mesma linha é o embaralhado.
+        assert not (("sucesso" in linha) and ("falha" in linha)), f"embaralhou: {linha!r}"
+        assert not (("recuperado" in linha) and ("janela" in linha)), f"embaralhou: {linha!r}"
+    # E o cursor foi para a segunda opção, como pedido.
+    assert any(l.strip().startswith("→") and "falha" in l for l in linhas), linhas

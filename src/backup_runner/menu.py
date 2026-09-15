@@ -11,6 +11,7 @@ que importa fica sempre nas primeiras linhas.
 from __future__ import annotations
 
 from . import console as c
+from . import keys
 from . import forms, prompt, views
 from . import __version__
 from .context import Context
@@ -35,6 +36,16 @@ def moldura(ctx: Context, *trilha: str) -> None:
 
 
 def principal(ctx: Context) -> int:
+    try:
+        return _laco(ctx)
+    finally:
+        # Sai deixando o terminal como encontrou: cursor visível, na coluna 0,
+        # numa linha nova. Sem isto o prompt do shell aparece no meio da linha.
+        keys.mostra_cursor()
+        print()
+
+
+def _laco(ctx: Context) -> int:
     while True:
         ctx.refresh()
         moldura(ctx)

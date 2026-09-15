@@ -62,7 +62,15 @@ _estado_anterior = None
 
 @contextlib.contextmanager
 def cru():
-    """Mantém o terminal em modo cru enquanto o bloco roda.
+    """Lê tecla a tecla, sem eco, mas com a saída intacta.
+
+    Usa `setcbreak` e não `setraw`. A diferença importa: `setraw` desliga
+    também o pós-processamento da saída, e sem ele um `\n` desce uma linha sem
+    voltar para a coluna 0. O efeito é a tela escadinha e o prompt do shell
+    aparecendo no meio da linha quando o programa sai.
+
+    `setcbreak` desliga só o modo de linha e o eco, que é o que precisamos para
+    ler seta e tecla solta.
 
     Entrar e sair a cada tecla parece inofensivo e não é: entre uma leitura e
     outra o terminal volta ao modo de linha, e o que já estava digitado se
@@ -76,7 +84,7 @@ def cru():
     fd = sys.stdin.fileno()
     if _profundidade == 0:
         _estado_anterior = termios.tcgetattr(fd)
-        tty.setraw(fd)
+        tty.setcbreak(fd)
     _profundidade += 1
     try:
         yield fd
