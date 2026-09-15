@@ -92,6 +92,15 @@ backup-runner self reinstall --ref main          # a ponta do main, para testar
 backup-runner self reinstall --local ~/dev/labs/backup-runner
 ```
 
+O `--limpo` recria o ambiente do zero em vez de instalar por cima. Vale quando
+uma versão deixa de usar uma dependência: o `pipx install --force` reaproveita
+o ambiente e a biblioteca antiga fica para trás. O programa avisa quando
+encontra uma dessas sobras.
+
+```sh
+backup-runner self reinstall --ref latest --limpo
+```
+
 ### Ver o que está instalado
 
 ```sh

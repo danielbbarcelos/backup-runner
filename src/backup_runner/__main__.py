@@ -392,7 +392,11 @@ def _self_install(sm, args: argparse.Namespace, *, reinstalar: bool) -> int:
         return 1
 
     c.info(f"instalando do {ref.descricao()}")
-    ok, saida = sm.install(ref, force=reinstalar or args.force or atual.presente)
+    ok, saida = sm.install(
+        ref,
+        force=reinstalar or args.force or atual.presente,
+        limpo=args.limpo,
+    )
     if not ok:
         print(saida, file=sys.stderr)
         c.erro("a instalação falhou")
@@ -404,6 +408,11 @@ def _self_install(sm, args: argparse.Namespace, *, reinstalar: bool) -> int:
         c.nota(depois.caminho)
     else:
         c.aviso("o binário não apareceu no PATH; talvez seja preciso reabrir o shell")
+    sobras = sm.orfas()
+    if sobras:
+        c.aviso(f"sobraram no ambiente pacotes que o projeto não usa mais: {', '.join(sobras)}")
+        c.nota(f"para limpar: {APP_SLUG} self reinstall --limpo")
+
     print()
     c.nota(f"abra com: {APP_SLUG}")
     c.nota(f"agende:   {APP_SLUG} install")
@@ -544,6 +553,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="latest (padrão), uma tag como v0.3.0, um hash de commit, ou main")
     s.add_argument("--local", default=None, help="instala de um clone local")
     s.add_argument("--force", action="store_true")
+    s.add_argument("--limpo", action="store_true",
+                   help="recria o ambiente do zero, tirando dependências antigas")
     s.add_argument("--purge", action="store_true", help="na remoção, apaga config e dados")
     s.add_argument("--yes", action="store_true")
     s.set_defaults(func=cmd_self)

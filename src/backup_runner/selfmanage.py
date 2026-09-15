@@ -206,18 +206,63 @@ def installed() -> Installed:
     )
 
 
-def install(ref: Ref, *, force: bool = False) -> tuple[bool, str]:
+def install(ref: Ref, *, force: bool = False, limpo: bool = False) -> tuple[bool, str]:
+    """Instala via pipx.
+
+    `limpo` remove o venv antes de recriar. `pipx install --force` reaproveita o
+    venv existente e deixa para trás dependências que saíram do projeto: foi
+    assim que o textual sobreviveu à versão que parou de usá-lo. A troca é uma
+    janela curta sem o binário, então isto não é o padrão numa reinstalação
+    comum, só quando pedido.
+    """
     pipx = pipx_path()
     if not pipx:
         return False, (
             "o pipx não está no PATH.\n"
             "instale com: python3 -m pip install --user pipx && python3 -m pipx ensurepath"
         )
+    if limpo:
+        _rodar([pipx, "uninstall", APP_SLUG], titulo="a remoção")
     args = [pipx, "install", "--python", "python3"]
-    if force:
+    if force and not limpo:
         args.append("--force")
     args.append(ref.spec())
     return _rodar(args, titulo="a instalação")
+
+
+def orfas() -> list[str]:
+    """Pacotes no venv que o projeto não declara mais.
+
+    Não são um problema de funcionamento, mas ocupam espaço e confundem quem
+    for investigar de onde veio uma versão.
+    """
+    import sysconfig
+
+    base = Path(
+        os.environ.get("PIPX_HOME") or (Path.home() / ".local" / "share" / "pipx")
+    ) / "venvs" / APP_SLUG
+    if not base.exists():
+        return []
+    metadados = list(base.glob(f"lib/python*/site-packages/{APP_SLUG.replace('-', '_')}-*.dist-info/METADATA"))
+    if not metadados:
+        return []
+    declaradas = set()
+    for linha in metadados[0].read_text().splitlines():
+        if linha.startswith("Requires-Dist:"):
+            nome = linha.split(":", 1)[1].strip().split(" ")[0]
+            for sep in ("=", ">", "<", "!", "[", ";"):
+                nome = nome.split(sep)[0]
+            declaradas.add(nome.strip().lower().replace("-", "_"))
+    # Só reporta os que nós já declaramos algum dia e agora não usamos mais.
+    conhecidas_antigas = {"textual", "rich", "questionary"}
+    instaladas = {
+        d.name.split("-")[0].lower()
+        for d in metadados[0].parent.parent.glob("*.dist-info")
+    }
+    return sorted(
+        nome for nome in conhecidas_antigas
+        if nome in instaladas and nome not in declaradas
+    )
 
 
 def uninstall() -> tuple[bool, str]:
