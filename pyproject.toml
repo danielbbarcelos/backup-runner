@@ -10,12 +10,24 @@ readme = "README.md"
 requires-python = ">=3.10"
 authors = [{ name = "Daniel" }]
 license = { text = "MIT" }
+keywords = ["backup", "mysql", "mysqldump", "s3", "sftp", "tui", "textual"]
+classifiers = [
+    "Environment :: Console",
+    "Intended Audience :: System Administrators",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Topic :: System :: Archiving :: Backup",
+]
 dependencies = [
     "textual>=0.80",
     "cryptography>=41.0",
     "boto3>=1.34",
     "paramiko>=2.12",
 ]
+
+[project.urls]
+Homepage = "https://github.com/danielbbarcelos/backup-runner"
+Issues = "https://github.com/danielbbarcelos/backup-runner/issues"
 
 [project.scripts]
 backup-runner = "backup_runner.__main__:main"

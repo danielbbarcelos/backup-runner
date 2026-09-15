@@ -1,11 +1,15 @@
 """Ponto de entrada.
 
-  backup-runner            abre a interface
-  backup-runner tick       decide o que entra na fila (o cron chama isto)
-  backup-runner worker     consome a fila (o supervisord chama isto)
-  backup-runner install    escreve o cron e gera o conf do supervisord
-  backup-runner status     estado do sistema, sem abrir a interface
-  backup-runner demo       popula dados de demonstração
+  backup-runner                 abre a interface
+  backup-runner tick            decide o que entra na fila (o cron chama isto)
+  backup-runner worker          consome a fila (o supervisord chama isto)
+  backup-runner install         escreve o cron e gera o conf do supervisord
+  backup-runner status          estado do sistema, sem abrir a interface
+  backup-runner demo            popula dados de demonstração
+  backup-runner self install    instala ou atualiza o próprio programa
+  backup-runner self uninstall  remove o programa
+  backup-runner self reinstall  reinstala, na mesma referência ou noutra
+  backup-runner self status     de onde veio a instalação atual
 
 O `install` escreve no crontab do próprio usuário sozinho, porque isso não
 precisa de sudo. Para o supervisord ele gera o arquivo e imprime as linhas de
@@ -136,6 +140,124 @@ def cmd_demo(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_self(args: argparse.Namespace) -> int:
+    from . import selfmanage as sm
+
+    acao = args.acao or "status"
+
+    if acao == "status":
+        return _self_status(sm)
+    if acao == "releases":
+        releases = sm.list_releases()
+        if not releases:
+            print("nenhum release publicado ainda")
+            return 1
+        for tag, data, titulo in releases:
+            print(f"{tag:<12} {data}  {titulo}")
+        return 0
+    if acao == "uninstall":
+        return _self_uninstall(sm, args)
+    return _self_install(sm, args, reinstalar=acao == "reinstall")
+
+
+def _self_status(sm) -> int:
+    atual = sm.installed()
+    if not atual.presente:
+        print("✗ não está instalado")
+        print(f"  instale com: python3 -m {__package__} self install")
+        return 1
+    print(f"✓ instalado      {atual.versao or 'versão desconhecida'}")
+    print(f"  origem         {atual.origem()}")
+    if atual.caminho:
+        print(f"  binário        {atual.caminho}")
+    if atual.python:
+        print(f"  python         {atual.python}")
+    if not sm.pipx_path():
+        print("  ! o pipx não está no PATH, então atualizar daqui não vai funcionar")
+    return 0
+
+
+def _self_install(sm, args: argparse.Namespace, *, reinstalar: bool) -> int:
+    try:
+        ref = sm.resolve_ref(args.ref, local=args.local)
+    except sm.SelfError as exc:
+        print(f"✗ {exc}", file=sys.stderr)
+        return 2
+
+    atual = sm.installed()
+    if atual.presente and not reinstalar and not args.force:
+        print(f"já instalado: {atual.versao} ({atual.origem()})")
+        print(f"para trocar a referência use: {APP_SLUG} self reinstall --ref {args.ref or 'latest'}")
+        return 1
+
+    print(f"● instalando do {ref.descricao()}")
+    ok, saida = sm.install(ref, force=reinstalar or args.force or atual.presente)
+    if not ok:
+        print(saida, file=sys.stderr)
+        print("✗ a instalação falhou", file=sys.stderr)
+        return 1
+
+    depois = sm.installed()
+    print(f"✓ {APP_SLUG} {depois.versao or ''} instalado de {ref.descricao()}".rstrip())
+    if depois.caminho:
+        print(f"  {depois.caminho}")
+    else:
+        print("  ! o binário não apareceu no PATH; talvez seja preciso reabrir o shell")
+    print()
+    print(f"  abra com: {APP_SLUG}")
+    print(f"  agende:   {APP_SLUG} install")
+    return 0
+
+
+def _self_uninstall(sm, args: argparse.Namespace) -> int:
+    atual = sm.installed()
+    if not atual.presente:
+        print("não está instalado")
+        return 1
+
+    if not args.yes:
+        print(f"isto remove o programa ({atual.versao or 'versão desconhecida'}).")
+        if args.purge:
+            print("e APAGA jobs, destinos, segredos e histórico em:")
+            for caminho in sm.purge_paths():
+                print(f"  {caminho}")
+        else:
+            print("jobs, destinos e histórico ficam onde estão.")
+        resposta = input("continuar? [s/N] ").strip().lower()
+        if resposta not in ("s", "sim", "y", "yes"):
+            print("cancelado")
+            return 1
+
+    # O cron fica órfão se o binário sumir, então sai junto.
+    from .health import tick_installed, uninstall_tick
+
+    if tick_installed():
+        ok_tick, msg_tick = uninstall_tick()
+        print(("✓ crontab: " if ok_tick else "! crontab: ") + msg_tick)
+
+    ok, saida = sm.uninstall()
+    if not ok:
+        print(saida, file=sys.stderr)
+        return 1
+    print("✓ programa removido")
+
+    if args.purge:
+        import shutil as _shutil
+
+        for caminho in sm.purge_paths():
+            if caminho.exists():
+                _shutil.rmtree(caminho, ignore_errors=True)
+                print(f"✓ apagado {caminho}")
+    else:
+        print("  jobs, destinos e histórico continuam em ~/.config e ~/.local/share")
+        print(f"  para apagar também: {APP_SLUG} self uninstall --purge")
+
+    print("  o worker do supervisord, se existir, precisa sair na mão:")
+    print("    sudo rm /etc/supervisor/conf.d/backup-runner.conf")
+    print("    sudo supervisorctl reread && sudo supervisorctl update")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog=APP_SLUG, description=__doc__.splitlines()[0])
     parser.add_argument("--locale", choices=["pt-BR", "en-US"], default=None)
@@ -166,6 +288,21 @@ def build_parser() -> argparse.ArgumentParser:
     p_demo = sub.add_parser("demo", help="popula dados de demonstração")
     p_demo.add_argument("--yes", action="store_true", help="não perguntar")
     p_demo.set_defaults(func=cmd_demo)
+
+    p_self = sub.add_parser("self", help="instala, remove e atualiza o próprio programa")
+    p_self.add_argument(
+        "acao", nargs="?", default="status",
+        choices=["install", "uninstall", "reinstall", "status", "releases"],
+    )
+    p_self.add_argument(
+        "--ref", default=None,
+        help="latest (padrão), uma tag como v0.2.0, um hash de commit do main, ou main",
+    )
+    p_self.add_argument("--local", default=None, help="instala de um clone local em vez do GitHub")
+    p_self.add_argument("--force", action="store_true", help="instala por cima sem perguntar")
+    p_self.add_argument("--purge", action="store_true", help="na remoção, apaga também config e dados")
+    p_self.add_argument("--yes", action="store_true", help="não perguntar na remoção")
+    p_self.set_defaults(func=cmd_self)
 
     return parser
 
