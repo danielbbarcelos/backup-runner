@@ -712,3 +712,51 @@ def test_canal_nao_configurado_nao_avisa_ninguem():
 
     settings.smtp = {"host": "smtp.exemplo.com", "to": "eu@exemplo.com"}
     assert settings.channel_configured("email") is True
+
+
+def test_redesenho_nao_embaralha_o_bloco():
+    """Regressão: o texto novo saía deslocado por cima do antigo.
+
+    A causa foi a soma de duas coisas: o respiro no rodapé mudou a altura do
+    bloco, e `\\033[2K` apaga a linha mas não devolve o cursor à coluna 0. O
+    sintoma na tela era duas opções na mesma linha, cada uma começando onde a
+    anterior parou.
+    """
+    import os
+
+    codigo = (
+        "import sys; sys.path.insert(0, %r);"
+        "from backup_runner import prompt;"
+        "v = prompt.escolhe('escolha', ["
+        "  ('a', 'alfa    primeira opcao'),"
+        "  ('b', 'bravo   segunda opcao'),"
+        "  ('c', 'charlie terceira opcao'),"
+        "], permitir_cancelar=False);"
+        "print('FIM:', v, flush=True)"
+    ) % os.path.join(os.getcwd(), "src")
+
+    texto = _num_pty(codigo, [b"\x1b[B", b"\x1b[B", b"\x1b[A", b"\r"])
+
+    for linha in texto.splitlines():
+        # Duas opções na mesma linha é exatamente o embaralhado.
+        assert not (("alfa" in linha) and ("bravo" in linha)), f"linha embaralhada: {linha!r}"
+        assert not (("bravo" in linha) and ("charlie" in linha)), f"linha embaralhada: {linha!r}"
+        assert linha.count("primeira opcao") <= 1, f"opção repetida na linha: {linha!r}"
+
+    assert "FIM: b" in texto
+
+
+def test_altura_do_bloco_bate_com_o_que_foi_impresso():
+    """O que sobe precisa ser exatamente o que desceu, senão a tela desalinha."""
+    import io
+    from contextlib import redirect_stdout
+
+    from backup_runner import prompt
+
+    bloco = ["linha 1", "linha 2", "", "teclas"]
+    saida = io.StringIO()
+    with redirect_stdout(saida):
+        altura = prompt._desenha_bloco(bloco, redesenhando=False)
+
+    assert altura == len(bloco)
+    assert saida.getvalue().count("\n") == altura

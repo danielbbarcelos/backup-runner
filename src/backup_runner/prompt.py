@@ -211,6 +211,20 @@ def escolhe(
     )
 
 
+def _desenha_bloco(linhas: list[str], *, redesenhando: bool) -> int:
+    """Escreve o bloco de opções e devolve quantas linhas ocupou.
+
+    Ao redesenhar, cada linha começa com `\r` para voltar à coluna 0 e `\033[2K`
+    para apagar o que estava lá. Sem o `\r`, o cursor fica na coluna em que
+    parou e o texto novo sai deslocado por cima do antigo, que foi exatamente
+    o embaralhado que apareceu na tela.
+    """
+    prefixo = "\r\033[2K" if redesenhando else ""
+    for linha in linhas:
+        print(prefixo + linha)
+    return len(linhas)
+
+
 def _linhas_opcoes(
     opcoes: Sequence[tuple[str, str]], foco: int, *, permitir_cancelar: bool,
     rotulo_saida: str = "cancelar",
@@ -244,19 +258,17 @@ def _escolhe_setas(
                 foco = i
                 break
 
-    rodape = "\n" + c.dim(
+    teclas = c.dim(
         f"   ↑↓ navega   enter escolhe   esc {rotulo_saida}"
         if permitir_cancelar
         else "   ↑↓ navega   enter escolhe"
     )
     print()
     print(f"  {c.secondary(pergunta)}")
-    linhas = _linhas_opcoes(
+    bloco = _linhas_opcoes(
         opcoes, foco, permitir_cancelar=permitir_cancelar, rotulo_saida=rotulo_saida,
-    )
-    for linha in linhas:
-        print(linha)
-    print(rodape)
+    ) + ["", teclas]
+    altura = _desenha_bloco(bloco, redesenhando=False)
 
     keys.esconde_cursor()
     try:
@@ -302,13 +314,11 @@ def _escolhe_setas(
                 continue
 
             # Redesenha só o bloco das opções, para não piscar a tela inteira.
-            keys.sobe(len(linhas) + 2)
-            linhas = _linhas_opcoes(
+            keys.sobe(altura)
+            bloco = _linhas_opcoes(
                 opcoes, foco, permitir_cancelar=permitir_cancelar, rotulo_saida=rotulo_saida,
-            )
-            for linha in linhas:
-                print("\033[2K" + linha)
-            print("\033[2K" + rodape)
+            ) + ["", teclas]
+            altura = _desenha_bloco(bloco, redesenhando=True)
     finally:
         keys.mostra_cursor()
 
@@ -391,14 +401,12 @@ def _marca_setas(
 ) -> list[str]:
     escolhidos = set(marcados)
     foco = 0
-    rodape = "\n" + c.dim("   ↑↓ navega   espaço marca   a todos   n nenhum   enter confirma")
+    teclas = c.dim("   ↑↓ navega   espaço marca   a todos   n nenhum   enter confirma")
 
     print()
     print(f"  {c.secondary(pergunta)}")
-    linhas = _linhas_marcacao(opcoes, escolhidos, foco)
-    for linha in linhas:
-        print(linha)
-    print(rodape)
+    bloco = _linhas_marcacao(opcoes, escolhidos, foco) + ["", teclas]
+    altura = _desenha_bloco(bloco, redesenhando=False)
 
     keys.esconde_cursor()
     try:
@@ -432,11 +440,9 @@ def _marca_setas(
             else:
                 continue
 
-            keys.sobe(len(linhas) + 2)
-            linhas = _linhas_marcacao(opcoes, escolhidos, foco)
-            for linha in linhas:
-                print("\033[2K" + linha)
-            print("\033[2K" + rodape)
+            keys.sobe(altura)
+            bloco = _linhas_marcacao(opcoes, escolhidos, foco) + ["", teclas]
+            altura = _desenha_bloco(bloco, redesenhando=True)
     finally:
         keys.mostra_cursor()
 
