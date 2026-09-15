@@ -200,7 +200,7 @@ def staging_info() -> StagingInfo:
 # ----------------------------------------------------------------------------
 
 def collect(destinations: list | None = None, next_job: tuple[str, int] | None = None) -> list[HealthItem]:
-    from .ui.theme import format_bytes, format_duration
+    from .format import format_bytes, format_duration
 
     itens: list[HealthItem] = []
 

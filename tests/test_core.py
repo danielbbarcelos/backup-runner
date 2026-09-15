@@ -408,7 +408,7 @@ def test_execucao_sobrevive_a_ida_e_volta_no_banco():
 # ----------------------------------------------------------------------------
 
 def test_formatacao_usa_virgula_decimal():
-    from backup_runner.ui.theme import format_bytes, format_count, format_duration
+    from backup_runner.format import format_bytes, format_count, format_duration
 
     assert format_bytes(2_100_000_000) == "2,0 GB"
     assert format_bytes(None) == "·"
@@ -417,14 +417,17 @@ def test_formatacao_usa_virgula_decimal():
     assert format_count(12481) == "12.481"
 
 
-def test_badge_traz_rotulo_traduzido_e_simbolo_proprio():
-    """Cor é reforço: o símbolo precisa distinguir sozinho."""
+def test_cada_resultado_tem_simbolo_proprio():
+    """Cor é reforço: o símbolo precisa distinguir sozinho.
+
+    Em terminal sem cor, com NO_COLOR, ou num pipe, é só o símbolo que resta.
+    """
+    from backup_runner import views
     from backup_runner.models import RunResult
-    from backup_runner.ui import markup as m
 
     simbolos = set()
     for resultado in RunResult:
-        simbolo, rotulo, _ = m.badge_parts(resultado)
-        assert not rotulo.startswith("badge."), "o rótulo saiu como chave de i18n"
+        simbolo, rotulo, _ = views.BADGE[resultado]
+        assert rotulo and not rotulo.startswith("badge.")
         simbolos.add(simbolo)
     assert len(simbolos) >= 5

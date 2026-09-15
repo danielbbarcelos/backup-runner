@@ -10,11 +10,11 @@ from __future__ import annotations
 import datetime as dt
 from dataclasses import dataclass, field
 
-from ..config import DestinationStore, JobStore, Settings
-from ..health import HealthItem, StagingInfo, collect, staging_info, tick_installed, worker_status
-from ..models import Destination, Job, JobDestination, Run, RunResult, SourceKind
-from ..schedule import humanize, next_run, previous_run
-from ..state import State
+from .config import DestinationStore, JobStore, Settings
+from .health import HealthItem, StagingInfo, collect, staging_info, tick_installed, worker_status
+from .models import Destination, Job, JobDestination, Run, RunResult, SourceKind
+from .schedule import humanize, next_run, previous_run
+from .state import State
 
 
 @dataclass

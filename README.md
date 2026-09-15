@@ -3,7 +3,8 @@
 Backup agendado de bancos MySQL e de diretórios, com destinos em pasta local,
 S3 compatível (DigitalOcean Spaces, AWS, Backblaze, MinIO) e SFTP.
 
-Interface de terminal em Textual, navegação só por teclado.
+Interface de linha de comando, com um menu numerado para quem não quer decorar
+comando. Sem framework de terminal: a saída é `print` e a entrada é `input`.
 
 Sucessor funcional do `mysql-dumper` (`~/dev/labs/mysql`), que continua
 existindo e não é tocado. O que passou de um para o outro é código copiado,
@@ -131,20 +132,44 @@ roda para sempre merece ser lido antes.
 
 ## Comandos
 
+Tudo que o programa faz é um comando. O menu (`backup-runner` sem argumento) é
+só uma casca por cima deles, então não existe caminho que funcione apenas pelo
+menu e tudo é automatizável.
+
 | Comando | O que faz |
 |---|---|
-| `backup-runner` | abre a interface |
-| `backup-runner status` | saúde do sistema, sem abrir a interface |
-| `backup-runner install` | escreve o cron e gera o conf do supervisord |
-| `backup-runner tick` | decide o que entra na fila (o cron chama isto) |
-| `backup-runner tick --install` | só a linha do crontab |
-| `backup-runner worker` | consome a fila (ainda não implementado) |
-| `backup-runner demo` | popula dados de demonstração |
-| `backup-runner self install` | instala o programa |
-| `backup-runner self reinstall` | troca de versão, com `--ref` |
-| `backup-runner self uninstall` | remove o programa |
-| `backup-runner self status` | de onde veio a instalação atual |
-| `backup-runner self releases` | releases publicados |
+| `backup-runner` | menu numerado |
+| `backup-runner status` | resumo: jobs, tick, worker, fila, próxima execução |
+| `backup-runner jobs` | lista os jobs |
+| `backup-runner job <nome>` | detalhe de um job |
+| `backup-runner job add` | cadastra um job, por perguntas |
+| `backup-runner job <nome> --editar` | edita |
+| `backup-runner job <nome> --pausar` | pausa ou retoma |
+| `backup-runner job <nome> --apagar` | apaga, pedindo o nome digitado |
+| `backup-runner run <nome>` | põe um job na fila agora |
+| `backup-runner history` | execuções (`--job`, `--falhas`, `--dias`) |
+| `backup-runner run-info <nº>` | detalhe de uma execução |
+| `backup-runner retry <nº>` | reenvia o artefato de uma execução pendente |
+| `backup-runner dest` | destinos (`add`, `show`, `test`, `edit`, `rm`) |
+| `backup-runner notify` | quais eventos avisam, e por onde |
+| `backup-runner health` | diagnóstico |
+| `backup-runner tick` | o que o cron chama |
+| `backup-runner worker` | o que o supervisord chama |
+| `backup-runner install` | instala o agendamento |
+| `backup-runner self ...` | instala, remove e atualiza o programa |
+
+A saída é texto simples, sem controle de tela, então funciona por ssh ruim,
+dentro de `tmux`, e num terminal que não entende sequência de escape. Com
+`NO_COLOR` ou fora de um terminal a cor some e a informação continua inteira,
+o que faz isto valer num cron:
+
+```sh
+backup-runner history --falhas | mail -s "backups com falha" eu@exemplo.com
+backup-runner health || echo "algo errado no backup"
+```
+
+Os códigos de saída seguem a convenção: `0` deu certo, `1` não encontrou ou
+falhou, `2` erro de uso, `3` o worker ainda não existe.
 
 ## Onde ficam as coisas
 
@@ -170,41 +195,6 @@ desacompanhado protege: se o worker consegue decifrar sozinho às três da
 manhã, qualquer coisa rodando na sua conta também consegue. Isso está
 registrado aqui para não haver ilusão depois.
 
-## Área de transferência
-
-As telas que oferecem `c copiar` usam, nesta ordem, `wl-copy`, `xclip`, `xsel`
-ou `pbcopy`, e conferem lendo de volta antes de dizer que copiaram. Sem
-nenhuma dessas ferramentas, o texto aparece numa notificação longa para você
-copiar com o mouse, junto com o comando que instala a que falta:
-
-```sh
-sudo apt install wl-clipboard   # Wayland
-sudo apt install xclip          # X11
-```
-
-## Teclas
-
-| Tecla | O que faz |
-|---|---|
-| `↑` `↓` | move no painel que está em foco |
-| `tab` | alterna entre a lista de jobs e o detalhe |
-| `enter` | abre o item em foco |
-| `esc` | volta um nível, nunca fecha o app |
-| `n` | novo job |
-| `r` | enfileira o job agora |
-| `p` | pausa ou retoma |
-| `d` | apaga, com confirmação por nome |
-| `h` `t` `a` `s` | histórico, destinos, avisos, saúde |
-| `i` | instala o tick no crontab |
-| `?` | ajuda da tela onde foi chamada |
-| `q` | sai, a partir do dashboard |
-
-No dashboard, o `tab` não é só decoração: ele entra no painel de detalhe, e
-lá as setas andam pelas últimas execuções do job, com `enter` abrindo a
-execução em foco. Com o foco na lista de jobs, o mesmo `enter` abre o
-histórico completo daquele job. A barra de baixo diz qual dos dois vale no
-momento.
-
 ## Desenvolvimento
 
 ```sh
@@ -226,6 +216,16 @@ Para instalar o que está no clone, por cima da versão publicada:
 backup-runner self reinstall --local .
 ```
 
-A interface veio de uma especificação visual feita no Claude Design, com
-paleta em tokens semânticos (`ui/theme.py`), alvo de 100 por 32 células e
-comportamento definido para 80 colunas.
+### Como o código está dividido
+
+O motor não sabe que existe terminal, e a camada de terminal não sabe o que é
+um dump. Dá para trocar uma sem tocar na outra.
+
+| Camada | Módulos |
+|---|---|
+| Motor | `models`, `config`, `state`, `schedule`, `tick`, `health`, `mysql` |
+| Terminal | `console` (cor e tabela), `prompt` (perguntas), `views` (o que mostra), `forms` (cadastro), `menu` |
+| Comandos | `__main__` |
+
+`views` imprime e nunca pergunta; `forms` pergunta e só grava no fim. É o que
+permite a mesma função servir ao comando direto e ao menu.

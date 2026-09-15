@@ -1,0 +1,312 @@
+"""Menu numerado, a porta de entrada para quem não quer decorar comando.
+
+É uma casca fina: cada item chama exatamente a mesma função que o comando
+direto chama. Não existe caminho que só funcione pelo menu, o que significa que
+tudo é automatizável e que o menu não vira um segundo programa para manter.
+"""
+from __future__ import annotations
+
+from . import console as c
+from . import forms, prompt, views
+from . import __version__
+from .context import Context
+from .models import RunResult
+
+
+def principal(ctx: Context) -> int:
+    c.banner(__version__, "backup agendado de bancos mysql e diretórios")
+    while True:
+        ctx.refresh()
+        views.resumo(ctx)
+        try:
+            escolha = prompt.escolhe(
+                "o que você quer fazer",
+                [
+                    ("jobs", "jobs           listar, criar, editar, rodar"),
+                    ("hist", "execuções      histórico e detalhe"),
+                    ("dest", "destinos       listar, criar, testar"),
+                    ("avisos", "avisos         quais eventos notificam"),
+                    ("saude", "saúde          tick, worker, chave, espaço"),
+                    ("sair", "sair"),
+                ],
+                permitir_cancelar=False,
+            )
+        except prompt.Cancelado:
+            return 0
+
+        try:
+            if escolha == "sair":
+                return 0
+            {
+                "jobs": menu_jobs,
+                "hist": menu_historico,
+                "dest": menu_destinos,
+                "avisos": menu_avisos,
+                "saude": menu_saude,
+            }[escolha](ctx)
+        except prompt.Cancelado:
+            c.info("cancelado")
+
+
+# ----------------------------------------------------------------------------
+
+def menu_jobs(ctx: Context) -> None:
+    while True:
+        ctx.refresh()
+        c.titulo("jobs")
+        views.lista_jobs(ctx, dicas=False)
+
+        opcoes = [("novo", "criar um job")]
+        if ctx.views:
+            opcoes = [
+                ("abrir", "abrir um job"),
+                ("rodar", "rodar um job agora"),
+                ("pausar", "pausar ou retomar"),
+                ("editar", "editar"),
+                ("apagar", "apagar"),
+            ] + opcoes
+        opcoes.append(("voltar", "voltar"))
+
+        escolha = prompt.escolhe("jobs", opcoes, permitir_cancelar=False)
+        if escolha == "voltar":
+            return
+        if escolha == "novo":
+            forms.novo_job(ctx)
+            continue
+
+        view = _escolhe_job(ctx)
+        if view is None:
+            continue
+
+        if escolha == "abrir":
+            views.detalhe_job(ctx, view, dicas=False)
+            prompt.pausa()
+        elif escolha == "rodar":
+            ctx.state.enqueue(view.name, _agora())
+            c.sucesso(f"{view.name} entrou na fila")
+            _avisa_sem_worker(ctx)
+        elif escolha == "pausar":
+            job = view.job
+            job.enabled = not job.enabled
+            job.paused_at = None if job.enabled else _hoje()
+            ctx.jobs.put(job)
+            c.sucesso(f"{job.name} " + ("retomado" if job.enabled else "pausado"))
+        elif escolha == "editar":
+            if view.job.kind.value == "mysql":
+                forms.job_mysql(ctx, view.job)
+            else:
+                forms.job_arquivos(ctx, view.job)
+        elif escolha == "apagar":
+            _apaga_job(ctx, view)
+
+
+def _apaga_job(ctx: Context, view) -> None:
+    execucoes = ctx.state.count_runs(job=view.name)
+    destinos = ctx.job_destinations(view.job)
+    c.aviso(f"apagar {view.name} remove também:")
+    c.item("•", f"{execucoes} registros de execução")
+    for jd, destino in destinos:
+        c.item("•", f"os artefatos em {jd.name}, conforme a retenção de {jd.days(destino)} dias")
+    if not prompt.confirma_digitando("isto não tem volta", view.name):
+        c.info("cancelado")
+        return
+    ctx.state.delete_job_runs(view.name)
+    ctx.jobs.delete(view.name)
+    ctx.refresh()
+    c.sucesso(f"{view.name} apagado")
+
+
+def _escolhe_job(ctx: Context):
+    if not ctx.views:
+        return None
+    nome = prompt.escolhe(
+        "qual job",
+        [(v.name, f"{v.name.ljust(20)} {views.badge(v.last.result if v.last else None)}")
+         for v in ctx.views],
+    )
+    return ctx.view(nome)
+
+
+# ----------------------------------------------------------------------------
+
+def menu_historico(ctx: Context) -> None:
+    filtro_job = None
+    filtro_resultado = None
+    while True:
+        execucoes = ctx.state.runs(
+            job=filtro_job,
+            results=[filtro_resultado] if filtro_resultado else None,
+            limit=40,
+        )
+        rotulo = ", ".join(
+            x for x in [filtro_job, filtro_resultado.value if filtro_resultado else None] if x
+        )
+        c.titulo("execuções", sub=rotulo)
+        views.historico(ctx, execucoes, filtro=rotulo, dicas=False)
+
+        escolha = prompt.escolhe(
+            "execuções",
+            [
+                ("abrir", "abrir uma execução"),
+                ("job", "filtrar por job"),
+                ("falhas", "só falhas e pendências"),
+                ("limpar", "limpar filtros"),
+                ("voltar", "voltar"),
+            ],
+            permitir_cancelar=False,
+        )
+        if escolha == "voltar":
+            return
+        if escolha == "abrir":
+            if not execucoes:
+                continue
+            numero = prompt.inteiro("número da execução", padrao=execucoes[0].id, minimo=1)
+            run = ctx.state.get_run(numero)
+            if run is None:
+                c.erro(f"não existe execução {numero}")
+                continue
+            views.detalhe_execucao(ctx, run)
+            prompt.pausa()
+        elif escolha == "job":
+            view = _escolhe_job(ctx)
+            filtro_job = view.name if view else None
+        elif escolha == "falhas":
+            filtro_resultado = RunResult.FAILED
+        elif escolha == "limpar":
+            filtro_job = filtro_resultado = None
+
+
+# ----------------------------------------------------------------------------
+
+def menu_destinos(ctx: Context) -> None:
+    while True:
+        ctx.refresh()
+        c.titulo("destinos")
+        views.lista_destinos(ctx, dicas=False)
+
+        opcoes = [("novo", "criar um destino")]
+        if ctx.destinations.list():
+            opcoes = [
+                ("abrir", "abrir um destino"),
+                ("testar", "testar"),
+                ("editar", "editar"),
+                ("apagar", "apagar"),
+            ] + opcoes
+        opcoes.append(("voltar", "voltar"))
+
+        escolha = prompt.escolhe("destinos", opcoes, permitir_cancelar=False)
+        if escolha == "voltar":
+            return
+        if escolha == "novo":
+            forms.novo_destino(ctx)
+            continue
+
+        destino = _escolhe_destino(ctx)
+        if destino is None:
+            continue
+
+        if escolha == "abrir":
+            views.detalhe_destino(ctx, destino)
+            prompt.pausa()
+        elif escolha == "testar":
+            forms.testa_destino(destino)
+        elif escolha == "editar":
+            forms.novo_destino(ctx, destino)
+        elif escolha == "apagar":
+            usos = ctx.destination_users(destino.name)
+            if usos:
+                c.erro(f"{len(usos)} job(s) apontam para ele: {', '.join(usos)}")
+                c.nota("tire o destino desses jobs antes de apagar")
+                continue
+            if prompt.confirma(f"apagar {destino.name}", padrao=False):
+                ctx.destinations.delete(destino.name)
+                ctx.refresh()
+                c.sucesso("apagado")
+
+
+def _escolhe_destino(ctx: Context):
+    destinos = ctx.destinations.list()
+    if not destinos:
+        return None
+    nome = prompt.escolhe(
+        "qual destino",
+        [(d.name, f"{d.name.ljust(16)} {d.kind.value.ljust(6)} {d.location()}") for d in destinos],
+    )
+    return ctx.destinations.get(nome)
+
+
+# ----------------------------------------------------------------------------
+
+def menu_avisos(ctx: Context) -> None:
+    alvo = prompt.escolhe(
+        "avisos de quem",
+        [("global", "o padrão global, que todo job herda")]
+        + [(v.name, f"o job {v.name}") for v in ctx.views],
+    )
+    job = None if alvo == "global" else ctx.jobs.get(alvo)
+    views.matriz_avisos(ctx, job)
+
+    if not prompt.confirma("mudar algum aviso", padrao=False):
+        return
+
+    from .models import CHANNELS, NOTIFY_EVENTS
+
+    evento_nome = prompt.escolhe(
+        "qual evento",
+        [(e.value, views._nome_evento(e)) for e in NOTIFY_EVENTS],
+    )
+    evento = next(e for e in NOTIFY_EVENTS if e.value == evento_nome)
+    canal_nome = prompt.escolhe("qual canal", [(c_.value, c_.value) for c_ in CHANNELS])
+    canal = next(c_ for c_ in CHANNELS if c_.value == canal_nome)
+
+    padrao = ctx.settings.notify_global
+    matriz = padrao if job is None else job.notify
+    atual = matriz.resolve(evento, canal, padrao)
+    novo = prompt.confirma(f"avisar por {canal.value} quando {views._nome_evento(evento)}", padrao=not atual)
+    matriz.set(evento, canal, novo)
+
+    if job is None:
+        ctx.settings.save()
+    else:
+        ctx.jobs.put(job)
+    c.sucesso("aviso atualizado")
+
+
+# ----------------------------------------------------------------------------
+
+def menu_saude(ctx: Context) -> None:
+    ctx.invalidate_health()
+    views.saude(ctx)
+
+    from .health import install_tick, tick_installed
+
+    opcoes = []
+    if not tick_installed():
+        opcoes.append(("tick", "instalar o tick no crontab"))
+    opcoes += [("rever", "verificar de novo"), ("voltar", "voltar")]
+
+    escolha = prompt.escolhe("saúde", opcoes, permitir_cancelar=False)
+    if escolha == "tick":
+        ok, mensagem = install_tick()
+        (c.sucesso if ok else c.erro)(mensagem)
+    elif escolha == "rever":
+        menu_saude(ctx)
+
+
+# ----------------------------------------------------------------------------
+
+def _agora():
+    import datetime
+
+    return datetime.datetime.now()
+
+
+def _hoje() -> str:
+    import datetime
+
+    return datetime.date.today().strftime("%d/%m")
+
+
+def _avisa_sem_worker(ctx: Context) -> None:
+    if not ctx.worker.running:
+        c.nota("o worker ainda não existe, então a fila acumula até ele entrar")
