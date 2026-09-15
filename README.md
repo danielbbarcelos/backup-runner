@@ -167,10 +167,25 @@ menu e tudo é automatizável.
 | `backup-runner install` | instala o agendamento |
 | `backup-runner self ...` | instala, remove e atualiza o programa |
 
-A saída é texto simples, sem controle de tela, então funciona por ssh ruim,
-dentro de `tmux`, e num terminal que não entende sequência de escape. Com
-`NO_COLOR` ou fora de um terminal a cor some e a informação continua inteira,
-o que faz isto valer num cron:
+### O menu
+
+`backup-runner` sem argumento abre o menu. Num terminal, as setas andam e a
+opção em foco ganha `→`; `enter` escolhe, `esc` volta um nível, e digitar o
+número também funciona como atalho. Nas listas de marcação (destinos de um job,
+tabelas a ignorar), `espaço` marca, `a` marca todos e `n` limpa.
+
+Cada tela limpa e redesenha o mesmo cabeçalho com a trilha de onde se está, em
+vez de empilhar saída no scrollback.
+
+Fora de um terminal (num pipe, num cron, num teste) nada disso existe, e a
+escolha volta a ser por número. `BACKUP_RUNNER_SEM_SETAS=1` força esse modo.
+
+### Em script
+
+A saída dos comandos é texto simples, sem controle de tela, então funciona por
+ssh ruim, dentro de `tmux`, e num terminal que não entende sequência de escape.
+Com `NO_COLOR` ou fora de um terminal a cor some e a informação continua
+inteira, o que faz isto valer num cron:
 
 ```sh
 backup-runner history --falhas | mail -s "backups com falha" eu@exemplo.com

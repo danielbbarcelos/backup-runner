@@ -7,6 +7,7 @@ simulação de tecla: é o que torna esta camada barata de manter.
 from __future__ import annotations
 
 import io
+import sys
 import re
 from contextlib import redirect_stdout
 
@@ -354,3 +355,111 @@ def test_inteiro_recusa_texto_e_faixa(monkeypatch):
     respostas = iter(["abc", "0", "99", "7"])
     monkeypatch.setattr("builtins.input", lambda _: next(respostas))
     assert prompt.inteiro("dias", padrao=30, minimo=1, maximo=90) == 7
+
+
+# ----------------------------------------------------------------------------
+# Teclado
+# ----------------------------------------------------------------------------
+
+def test_sem_terminal_cai_no_modo_numerado():
+    """Num pipe, num cron ou num teste não há tecla para ler."""
+    from backup_runner import keys
+
+    assert keys.disponivel() is False
+
+
+def test_mapa_de_sequencias_cobre_as_setas():
+    from backup_runner import keys
+
+    assert keys.SEQUENCIAS["[A"] == keys.CIMA
+    assert keys.SEQUENCIAS["[B"] == keys.BAIXO
+    # Modo de aplicação manda O no lugar de [.
+    assert keys.SEQUENCIAS["OA"] == keys.CIMA
+    assert keys.SEQUENCIAS["OB"] == keys.BAIXO
+
+
+def test_ler_tecla_num_terminal_de_verdade():
+    """A seta precisa chegar como seta, não como Esc.
+
+    O bug original: `sys.stdin.read` enche um buffer interno de uma vez, então
+    o `select` que verifica se a sequência continua olhava um descritor já
+    vazio e concluía que era a tecla Esc sozinha. Só um terminal de verdade
+    exercita isso, então o teste abre um.
+    """
+    import os
+    import pty
+    import time
+
+    codigo = (
+        "import sys; sys.path.insert(0, %r);"
+        "from backup_runner import keys;"
+        "print('LIDO:', keys.ler(), flush=True)"
+    ) % os.path.join(os.getcwd(), "src")
+
+    pid, fd = pty.fork()
+    if pid == 0:
+        os.execv(sys.executable, [sys.executable, "-c", codigo])
+
+    time.sleep(0.8)
+    os.write(fd, b"\x1b[B")          # seta para baixo
+    saida = b""
+    fim = time.time() + 3
+    while time.time() < fim:
+        try:
+            pedaco = os.read(fd, 1024)
+        except OSError:
+            break
+        if not pedaco:
+            break
+        saida += pedaco
+        if b"LIDO:" in saida:
+            break
+    try:
+        os.waitpid(pid, os.WNOHANG)
+    except ChildProcessError:
+        pass
+
+    texto = saida.decode(errors="replace")
+    assert "LIDO: baixo" in texto, f"a seta não chegou como seta: {texto!r}"
+
+
+def test_marca_varios_por_numero_ainda_funciona(monkeypatch):
+    """O caminho sem terminal não pode regredir por causa do caminho com setas."""
+    from backup_runner import prompt
+
+    opcoes = [(str(i), f"item {i}") for i in range(1, 5)]
+    respostas = iter(["todos", "2", ""])
+    monkeypatch.setattr("builtins.input", lambda _: next(respostas))
+    assert prompt.marca_varios("marque", opcoes) == ["1", "3", "4"]
+
+
+def test_hero_cabe_em_quatro_linhas():
+    """O wordmark de doze linhas reaparecia a cada navegação."""
+    import importlib
+    import os
+
+    os.environ["FORCE_COLOR"] = "1"
+    import backup_runner.console as console
+
+    importlib.reload(console)
+    try:
+        saida = io.StringIO()
+        with redirect_stdout(saida):
+            console.hero("9.9.9", "uma linha de descrição", estado="4 jobs")
+        linhas = saida.getvalue().rstrip("\n").split("\n")
+        assert len(linhas) == 5, f"o hero cresceu para {len(linhas)} linhas"
+        assert linhas[0].strip().startswith("\033[38;5;147m╭") or "╭" in linhas[0]
+        assert "╰" in linhas[-1]
+    finally:
+        del os.environ["FORCE_COLOR"]
+        importlib.reload(console)
+
+
+def test_limpa_tela_nao_suja_pipe():
+    """Uma sequência de escape num arquivo redirecionado seria lixo."""
+    from backup_runner import console
+
+    saida = io.StringIO()
+    with redirect_stdout(saida):
+        console.limpa()
+    assert saida.getvalue() == ""

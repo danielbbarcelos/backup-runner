@@ -202,22 +202,56 @@ def barra(fracao: float, comprimento: int = 30) -> str:
 
 
 # ----------------------------------------------------------------------------
+# Tela
+# ----------------------------------------------------------------------------
+
+def limpa() -> None:
+    """Limpa a tela e leva o cursor ao topo.
+
+    Só num terminal: num pipe ou num cron, uma sequência de escape no meio da
+    saída seria lixo no arquivo.
+    """
+    import sys
+
+    if sys.stdout.isatty():
+        sys.stdout.write("\033[2J\033[H")
+        sys.stdout.flush()
+
+
+def caixa(linhas: list[str], *, cor_borda: str = PRIMARY, largura_interna: int | None = None) -> list[str]:
+    """Envolve as linhas numa borda arredondada, alinhando pelo texto visível."""
+    conteudo = max((visivel(l) for l in linhas), default=0)
+    interna = largura_interna or (conteudo + 2)
+    topo = cor(f"╭{'─' * interna}╮", cor_borda)
+    base = cor(f"╰{'─' * interna}╯", cor_borda)
+    lado = cor("│", cor_borda)
+    saida = [topo]
+    for l in linhas:
+        preenche = interna - visivel(l) - 1
+        saida.append(f"{lado} {l}{' ' * max(0, preenche)}{lado}")
+    saida.append(base)
+    return saida
+
+
+# ----------------------------------------------------------------------------
 # Abertura
 # ----------------------------------------------------------------------------
 
-def banner(versao: str, tagline: str) -> None:
-    """Wordmark só quando há espaço e é um terminal de verdade."""
-    from pathlib import Path
+def hero(versao: str, tagline: str, *, estado: str = "") -> None:
+    """Cabeçalho compacto, dentro de uma caixa.
 
-    if not COR or largura() < 60:
-        print(bold(f"backup-runner {versao}"))
-        return
-    arquivo = Path(__file__).with_name("wordmark.txt")
-    try:
-        for linha_ in arquivo.read_text().rstrip("\n").splitlines():
-            print(primary(linha_))
-    except OSError:
-        print(bold(f"backup-runner {versao}"))
-        return
-    print()
-    print(muted(f"v{versao}    {tagline}"))
+    O wordmark em blocos ocupava doze linhas, que é quase metade de um terminal
+    curto e reaparecia a cada navegação. Aqui são quatro, com a marca à
+    esquerda e o estado do sistema à direita.
+    """
+    marca = primary("●─╮", bold=True)
+    marca2 = primary("├─●", bold=True)
+    marca3 = primary("●─╯", bold=True)
+    nome = bold(primary("backup-runner")) + "  " + muted(f"v{versao}")
+    linhas = [
+        f"{marca}   {nome}",
+        f"{marca2}   {muted(tagline)}",
+        f"{marca3}   {estado}" if estado else f"{marca3}",
+    ]
+    for l in caixa(linhas, largura_interna=max(46, min(largura() - 4, 72))):
+        print(l)

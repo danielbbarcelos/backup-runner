@@ -85,6 +85,10 @@ class Context:
     _views: list[JobView] = field(default_factory=list, init=False)
     _staging: StagingInfo | None = field(default=None, init=False)
     _health: list[HealthItem] = field(default_factory=list, init=False)
+    # `supervisorctl status` custa quase 0,4s, e a mesma tela pergunta várias
+    # vezes. Guardar por ciclo de refresh é o que mantém o menu instantâneo.
+    _worker: object | None = field(default=None, init=False)
+    _tick: bool | None = field(default=None, init=False)
 
     def __post_init__(self) -> None:
         self.refresh()
@@ -97,6 +101,8 @@ class Context:
         self._views = self._build_views()
         self._staging = None
         self._health = []
+        self._worker = None
+        self._tick = None
 
     def _build_views(self) -> list[JobView]:
         fila = self.state.queue_pending()
@@ -157,15 +163,21 @@ class Context:
     def invalidate_health(self) -> None:
         self._health = []
         self._staging = None
+        self._worker = None
+        self._tick = None
 
     # ------------------------------------------------------------------
     @property
     def tick_ok(self) -> bool:
-        return tick_installed()
+        if self._tick is None:
+            self._tick = tick_installed()
+        return self._tick
 
     @property
     def worker(self):
-        return worker_status()
+        if self._worker is None:
+            self._worker = worker_status()
+        return self._worker
 
     @property
     def queue_size(self) -> int:

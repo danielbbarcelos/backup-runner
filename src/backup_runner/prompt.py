@@ -15,6 +15,7 @@ import sys
 from typing import Callable, Sequence
 
 from . import console as c
+from . import keys
 
 
 class Cancelado(Exception):
@@ -97,14 +98,131 @@ def escolhe(
     *,
     padrao: str | None = None,
     permitir_cancelar: bool = True,
+    rotulo_saida: str = "cancelar",
 ) -> str:
-    """Escolha por número.
+    """Escolha de uma opção.
 
-    Número em vez de setas de propósito: a pessoa vê a lista inteira de uma vez,
-    pode conferir antes de digitar, e o que ela escolheu fica no scrollback.
+    Com terminal de verdade, anda com as setas e a opção em foco ganha `→`.
+    Digitar o número também funciona, e é o único caminho quando a entrada não
+    é um terminal (num pipe, num teste, num script), porque aí não há tecla
+    para ler.
     """
     if not opcoes:
         raise Cancelado
+    if keys.disponivel():
+        return _escolhe_setas(
+            pergunta, opcoes, padrao=padrao,
+            permitir_cancelar=permitir_cancelar, rotulo_saida=rotulo_saida,
+        )
+    return _escolhe_numero(
+        pergunta, opcoes, padrao=padrao,
+        permitir_cancelar=permitir_cancelar, rotulo_saida=rotulo_saida,
+    )
+
+
+def _linhas_opcoes(
+    opcoes: Sequence[tuple[str, str]], foco: int, *, permitir_cancelar: bool,
+    rotulo_saida: str = "cancelar",
+) -> list[str]:
+    linhas = []
+    for i, (_, rotulo) in enumerate(opcoes):
+        if i == foco:
+            linhas.append(f"   {c.primary('→', bold=True)} {c.bold(rotulo)}")
+        else:
+            linhas.append(f"     {rotulo}")
+    if permitir_cancelar:
+        marca = c.primary("→", bold=True) if foco == len(opcoes) else " "
+        texto_ = c.bold(rotulo_saida) if foco == len(opcoes) else c.muted(rotulo_saida)
+        linhas.append(f"   {marca} {texto_}")
+    return linhas
+
+
+def _escolhe_setas(
+    pergunta: str,
+    opcoes: Sequence[tuple[str, str]],
+    *,
+    padrao: str | None,
+    permitir_cancelar: bool,
+    rotulo_saida: str = "cancelar",
+) -> str:
+    total = len(opcoes) + (1 if permitir_cancelar else 0)
+    foco = 0
+    if padrao is not None:
+        for i, (chave, _) in enumerate(opcoes):
+            if chave == padrao:
+                foco = i
+                break
+
+    rodape = c.dim(
+        f"   ↑↓ navega   enter escolhe   esc {rotulo_saida}"
+        if permitir_cancelar
+        else "   ↑↓ navega   enter escolhe"
+    )
+    print()
+    print(f"  {c.secondary(pergunta)}")
+    linhas = _linhas_opcoes(
+        opcoes, foco, permitir_cancelar=permitir_cancelar, rotulo_saida=rotulo_saida,
+    )
+    for linha in linhas:
+        print(linha)
+    print(rodape)
+
+    keys.esconde_cursor()
+    try:
+        while True:
+            try:
+                tecla = keys.ler()
+            except (KeyboardInterrupt, EOFError):
+                print()
+                raise Cancelado from None
+
+            if tecla == keys.ENTER:
+                if permitir_cancelar and foco == len(opcoes):
+                    raise Cancelado
+                return opcoes[foco][0]
+            if tecla == keys.ESC or tecla == "q":
+                if permitir_cancelar:
+                    raise Cancelado
+                continue
+            if tecla == keys.CIMA:
+                foco = (foco - 1) % total
+            elif tecla == keys.BAIXO:
+                foco = (foco + 1) % total
+            elif tecla == keys.HOME:
+                foco = 0
+            elif tecla == keys.FIM:
+                foco = total - 1
+            elif tecla.isdigit():
+                # Digitar o número continua funcionando como atalho.
+                n = int(tecla)
+                if n == 0 and permitir_cancelar:
+                    raise Cancelado
+                if 1 <= n <= len(opcoes):
+                    return opcoes[n - 1][0]
+                continue
+            else:
+                continue
+
+            # Redesenha só o bloco das opções, para não piscar a tela inteira.
+            keys.sobe(len(linhas) + 1)
+            linhas = _linhas_opcoes(
+                opcoes, foco, permitir_cancelar=permitir_cancelar, rotulo_saida=rotulo_saida,
+            )
+            for linha in linhas:
+                print("\033[2K" + linha)
+            print("\033[2K" + rodape)
+    finally:
+        keys.mostra_cursor()
+
+
+def _escolhe_numero(
+    pergunta: str,
+    opcoes: Sequence[tuple[str, str]],
+    *,
+    padrao: str | None,
+    permitir_cancelar: bool,
+    rotulo_saida: str = "cancelar",
+) -> str:
     print()
     indice_padrao = None
     for i, (chave, rotulo) in enumerate(opcoes, 1):
@@ -114,7 +232,7 @@ def escolhe(
             marca = c.primary("•")
         print(f"   {marca} {c.primary(str(i).rjust(2))}  {rotulo}")
     if permitir_cancelar:
-        print(f"     {c.muted(' 0')}  {c.muted('cancelar')}")
+        print(f"     {c.muted(' 0')}  {c.muted(rotulo_saida)}")
     print()
 
     sufixo = f" [{indice_padrao}]" if indice_padrao else ""
@@ -124,7 +242,6 @@ def escolhe(
             return opcoes[indice_padrao - 1][0]
         if resposta == "0" and permitir_cancelar:
             raise Cancelado
-        # Aceita o número ou a própria chave digitada.
         for chave, _ in opcoes:
             if resposta == chave:
                 return chave
@@ -144,11 +261,89 @@ def marca_varios(
     *,
     marcados: Sequence[str] = (),
 ) -> list[str]:
-    """Marcação múltipla por números separados por espaço ou vírgula.
+    """Marcação múltipla.
 
-    Aceita também `todos`, `nenhum`, e intervalos como `2-5`, porque escolher
-    doze itens entre duzentos um a um é onde a paciência acaba.
+    Com terminal, as setas andam e o espaço marca. Sem terminal, números
+    separados por espaço, com intervalos como `2-5`, porque marcar doze itens
+    entre duzentos um a um é onde a paciência acaba.
     """
+    if keys.disponivel():
+        return _marca_setas(pergunta, opcoes, marcados=marcados)
+    return _marca_numeros(pergunta, opcoes, marcados=marcados)
+
+
+def _linhas_marcacao(
+    opcoes: Sequence[tuple[str, str]], escolhidos: set[str], foco: int
+) -> list[str]:
+    linhas = []
+    for i, (chave, rotulo) in enumerate(opcoes):
+        marca = c.primary("[✓]") if chave in escolhidos else c.dim("[ ]")
+        if i == foco:
+            linhas.append(f"   {c.primary('→', bold=True)} {marca} {c.bold(rotulo)}")
+        else:
+            linhas.append(f"     {marca} {rotulo}")
+    return linhas
+
+
+def _marca_setas(
+    pergunta: str,
+    opcoes: Sequence[tuple[str, str]],
+    *,
+    marcados: Sequence[str],
+) -> list[str]:
+    escolhidos = set(marcados)
+    foco = 0
+    rodape = c.dim("   ↑↓ navega   espaço marca   a todos   n nenhum   enter confirma")
+
+    print()
+    print(f"  {c.secondary(pergunta)}")
+    linhas = _linhas_marcacao(opcoes, escolhidos, foco)
+    for linha in linhas:
+        print(linha)
+    print(rodape)
+
+    keys.esconde_cursor()
+    try:
+        while True:
+            try:
+                tecla = keys.ler()
+            except (KeyboardInterrupt, EOFError):
+                print()
+                raise Cancelado from None
+
+            if tecla == keys.ENTER:
+                return [chave for chave, _ in opcoes if chave in escolhidos]
+            if tecla == keys.ESC:
+                raise Cancelado
+            if tecla == keys.CIMA:
+                foco = (foco - 1) % len(opcoes)
+            elif tecla == keys.BAIXO:
+                foco = (foco + 1) % len(opcoes)
+            elif tecla == keys.ESPACO:
+                chave = opcoes[foco][0]
+                escolhidos.discard(chave) if chave in escolhidos else escolhidos.add(chave)
+            elif tecla == "a":
+                escolhidos = {chave for chave, _ in opcoes}
+            elif tecla == "n":
+                escolhidos.clear()
+            else:
+                continue
+
+            keys.sobe(len(linhas) + 1)
+            linhas = _linhas_marcacao(opcoes, escolhidos, foco)
+            for linha in linhas:
+                print("\033[2K" + linha)
+            print("\033[2K" + rodape)
+    finally:
+        keys.mostra_cursor()
+
+
+def _marca_numeros(
+    pergunta: str,
+    opcoes: Sequence[tuple[str, str]],
+    *,
+    marcados: Sequence[str],
+) -> list[str]:
     escolhidos = set(marcados)
     while True:
         print()

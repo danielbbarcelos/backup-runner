@@ -1,8 +1,12 @@
-"""Menu numerado, a porta de entrada para quem não quer decorar comando.
+"""Menu, a porta de entrada para quem não quer decorar comando.
 
 É uma casca fina: cada item chama exatamente a mesma função que o comando
 direto chama. Não existe caminho que só funcione pelo menu, o que significa que
 tudo é automatizável e que o menu não vira um segundo programa para manter.
+
+Cada tela limpa e redesenha o mesmo cabeçalho, com a trilha de onde se está.
+Rolar para trás atrás do contexto é o que cansa num menu de terminal; aqui o
+que importa fica sempre nas primeiras linhas.
 """
 from __future__ import annotations
 
@@ -13,10 +17,27 @@ from .context import Context
 from .models import RunResult
 
 
+def moldura(ctx: Context, *trilha: str) -> None:
+    """Limpa a tela e redesenha o cabeçalho com a trilha de navegação."""
+    c.limpa()
+    total, ativos, _ = ctx.counts()
+    proxima = ctx.next_overall()
+    estado = c.muted(f"{total} jobs, {ativos} ativos")
+    if proxima is not None:
+        from .format import format_relative
+
+        estado += c.muted(f"   próxima em {format_relative(proxima[1])}")
+    if not ctx.tick_ok:
+        estado = c.danger(f"{c.SYM_FAIL} tick não instalado, nada roda")
+    c.hero(__version__, "backup agendado de bancos mysql e diretórios", estado=estado)
+    if trilha:
+        print("  " + c.dim(" › ".join(("início",) + trilha)))
+
+
 def principal(ctx: Context) -> int:
-    c.banner(__version__, "backup agendado de bancos mysql e diretórios")
     while True:
         ctx.refresh()
+        moldura(ctx)
         views.resumo(ctx)
         try:
             escolha = prompt.escolhe(
@@ -29,7 +50,8 @@ def principal(ctx: Context) -> int:
                     ("saude", "saúde          tick, worker, chave, espaço"),
                     ("sair", "sair"),
                 ],
-                permitir_cancelar=False,
+                permitir_cancelar=True,
+                rotulo_saida="sair",
             )
         except prompt.Cancelado:
             return 0
@@ -53,7 +75,7 @@ def principal(ctx: Context) -> int:
 def menu_jobs(ctx: Context) -> None:
     while True:
         ctx.refresh()
-        c.titulo("jobs")
+        moldura(ctx, "jobs")
         views.lista_jobs(ctx, dicas=False)
 
         opcoes = [("novo", "criar um job")]
@@ -67,7 +89,10 @@ def menu_jobs(ctx: Context) -> None:
             ] + opcoes
         opcoes.append(("voltar", "voltar"))
 
-        escolha = prompt.escolhe("jobs", opcoes, permitir_cancelar=False)
+        try:
+            escolha = prompt.escolhe("jobs", opcoes, rotulo_saida="voltar")
+        except prompt.Cancelado:
+            return
         if escolha == "voltar":
             return
         if escolha == "novo":
@@ -79,18 +104,21 @@ def menu_jobs(ctx: Context) -> None:
             continue
 
         if escolha == "abrir":
+            moldura(ctx, "jobs", view.name)
             views.detalhe_job(ctx, view, dicas=False)
-            prompt.pausa()
+            prompt.pausa("Enter volta")
         elif escolha == "rodar":
             ctx.state.enqueue(view.name, _agora())
             c.sucesso(f"{view.name} entrou na fila")
             _avisa_sem_worker(ctx)
+            prompt.pausa("Enter volta")
         elif escolha == "pausar":
             job = view.job
             job.enabled = not job.enabled
             job.paused_at = None if job.enabled else _hoje()
             ctx.jobs.put(job)
             c.sucesso(f"{job.name} " + ("retomado" if job.enabled else "pausado"))
+            prompt.pausa("Enter volta")
         elif escolha == "editar":
             if view.job.kind.value == "mysql":
                 forms.job_mysql(ctx, view.job)
@@ -119,11 +147,15 @@ def _apaga_job(ctx: Context, view) -> None:
 def _escolhe_job(ctx: Context):
     if not ctx.views:
         return None
-    nome = prompt.escolhe(
-        "qual job",
-        [(v.name, f"{v.name.ljust(20)} {views.badge(v.last.result if v.last else None)}")
-         for v in ctx.views],
-    )
+    try:
+        nome = prompt.escolhe(
+            "qual job",
+            [(v.name, f"{v.name.ljust(20)} {views.badge(v.last.result if v.last else None)}")
+             for v in ctx.views],
+            rotulo_saida="voltar",
+        )
+    except prompt.Cancelado:
+        return None
     return ctx.view(nome)
 
 
@@ -141,20 +173,23 @@ def menu_historico(ctx: Context) -> None:
         rotulo = ", ".join(
             x for x in [filtro_job, filtro_resultado.value if filtro_resultado else None] if x
         )
-        c.titulo("execuções", sub=rotulo)
+        moldura(ctx, "execuções" + (f" ({rotulo})" if rotulo else ""))
         views.historico(ctx, execucoes, filtro=rotulo, dicas=False)
 
-        escolha = prompt.escolhe(
-            "execuções",
-            [
-                ("abrir", "abrir uma execução"),
-                ("job", "filtrar por job"),
-                ("falhas", "só falhas e pendências"),
-                ("limpar", "limpar filtros"),
-                ("voltar", "voltar"),
-            ],
-            permitir_cancelar=False,
-        )
+        try:
+            escolha = prompt.escolhe(
+                "execuções",
+                [
+                    ("abrir", "abrir uma execução"),
+                    ("job", "filtrar por job"),
+                    ("falhas", "só falhas e pendências"),
+                    ("limpar", "limpar filtros"),
+                    ("voltar", "voltar"),
+                ],
+                rotulo_saida="voltar",
+            )
+        except prompt.Cancelado:
+            return
         if escolha == "voltar":
             return
         if escolha == "abrir":
@@ -165,8 +200,9 @@ def menu_historico(ctx: Context) -> None:
             if run is None:
                 c.erro(f"não existe execução {numero}")
                 continue
+            moldura(ctx, "execuções", f"#{run.id}")
             views.detalhe_execucao(ctx, run)
-            prompt.pausa()
+            prompt.pausa("Enter volta")
         elif escolha == "job":
             view = _escolhe_job(ctx)
             filtro_job = view.name if view else None
@@ -181,7 +217,7 @@ def menu_historico(ctx: Context) -> None:
 def menu_destinos(ctx: Context) -> None:
     while True:
         ctx.refresh()
-        c.titulo("destinos")
+        moldura(ctx, "destinos")
         views.lista_destinos(ctx, dicas=False)
 
         opcoes = [("novo", "criar um destino")]
@@ -194,7 +230,10 @@ def menu_destinos(ctx: Context) -> None:
             ] + opcoes
         opcoes.append(("voltar", "voltar"))
 
-        escolha = prompt.escolhe("destinos", opcoes, permitir_cancelar=False)
+        try:
+            escolha = prompt.escolhe("destinos", opcoes, rotulo_saida="voltar")
+        except prompt.Cancelado:
+            return
         if escolha == "voltar":
             return
         if escolha == "novo":
@@ -206,10 +245,13 @@ def menu_destinos(ctx: Context) -> None:
             continue
 
         if escolha == "abrir":
+            moldura(ctx, "destinos", destino.name)
             views.detalhe_destino(ctx, destino)
-            prompt.pausa()
+            prompt.pausa("Enter volta")
         elif escolha == "testar":
+            moldura(ctx, "destinos", destino.name, "teste")
             forms.testa_destino(destino)
+            prompt.pausa("Enter volta")
         elif escolha == "editar":
             forms.novo_destino(ctx, destino)
         elif escolha == "apagar":
@@ -228,16 +270,21 @@ def _escolhe_destino(ctx: Context):
     destinos = ctx.destinations.list()
     if not destinos:
         return None
-    nome = prompt.escolhe(
-        "qual destino",
-        [(d.name, f"{d.name.ljust(16)} {d.kind.value.ljust(6)} {d.location()}") for d in destinos],
-    )
+    try:
+        nome = prompt.escolhe(
+            "qual destino",
+            [(d.name, f"{d.name.ljust(16)} {d.kind.value.ljust(6)} {d.location()}") for d in destinos],
+            rotulo_saida="voltar",
+        )
+    except prompt.Cancelado:
+        return None
     return ctx.destinations.get(nome)
 
 
 # ----------------------------------------------------------------------------
 
 def menu_avisos(ctx: Context) -> None:
+    moldura(ctx, "avisos")
     alvo = prompt.escolhe(
         "avisos de quem",
         [("global", "o padrão global, que todo job herda")]
@@ -276,6 +323,7 @@ def menu_avisos(ctx: Context) -> None:
 
 def menu_saude(ctx: Context) -> None:
     ctx.invalidate_health()
+    moldura(ctx, "saúde")
     views.saude(ctx)
 
     from .health import install_tick, tick_installed
@@ -285,7 +333,12 @@ def menu_saude(ctx: Context) -> None:
         opcoes.append(("tick", "instalar o tick no crontab"))
     opcoes += [("rever", "verificar de novo"), ("voltar", "voltar")]
 
-    escolha = prompt.escolhe("saúde", opcoes, permitir_cancelar=False)
+    try:
+        escolha = prompt.escolhe("saúde", opcoes, rotulo_saida="voltar")
+    except prompt.Cancelado:
+        return
+    if escolha == "voltar":
+        return
     if escolha == "tick":
         ok, mensagem = install_tick()
         (c.sucesso if ok else c.erro)(mensagem)
