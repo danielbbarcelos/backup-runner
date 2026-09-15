@@ -186,9 +186,9 @@ sudo apt install xclip          # X11
 
 | Tecla | O que faz |
 |---|---|
-| `↑` `↓` | move na lista |
-| `tab` | alterna o painel em foco |
-| `enter` | abre o item |
+| `↑` `↓` | move no painel que está em foco |
+| `tab` | alterna entre a lista de jobs e o detalhe |
+| `enter` | abre o item em foco |
 | `esc` | volta um nível, nunca fecha o app |
 | `n` | novo job |
 | `r` | enfileira o job agora |
@@ -198,6 +198,12 @@ sudo apt install xclip          # X11
 | `i` | instala o tick no crontab |
 | `?` | ajuda da tela onde foi chamada |
 | `q` | sai, a partir do dashboard |
+
+No dashboard, o `tab` não é só decoração: ele entra no painel de detalhe, e
+lá as setas andam pelas últimas execuções do job, com `enter` abrindo a
+execução em foco. Com o foco na lista de jobs, o mesmo `enter` abre o
+histórico completo daquele job. A barra de baixo diz qual dos dois vale no
+momento.
 
 ## Desenvolvimento
 

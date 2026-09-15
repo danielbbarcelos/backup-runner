@@ -283,3 +283,83 @@ def test_clipboard_recusa_texto_vazio():
     from backup_runner.clipboard import copy
 
     assert not copy("").ok
+
+
+# ----------------------------------------------------------------------------
+# Navegação entre os painéis do dashboard
+# ----------------------------------------------------------------------------
+
+def test_tab_entra_no_detalhe_e_as_setas_andam_la():
+    """A seta precisa andar no painel que tem o foco.
+
+    O bug original: com o foco no detalhe, a seta movia a lista de jobs lá
+    atrás, trocando justamente o conteúdo que se estava tentando ler.
+    """
+    import asyncio
+
+    from backup_runner.ui.app import BackupRunnerApp
+    from backup_runner.ui.screens.dashboard import DetailPane
+
+    async def _rodar():
+        app = BackupRunnerApp(skip_splash=True)
+        async with app.run_test(size=(100, 32)) as pilot:
+            await pilot.pause()
+            lista = app.screen.query_one("#lista")
+            detalhe = app.screen.query_one("#detalhe", DetailPane)
+
+            indice_antes = lista.index
+            await pilot.press("tab")
+            await pilot.pause()
+            assert detalhe.tem_foco, "tab não levou o foco ao detalhe"
+
+            await pilot.press("down")
+            await pilot.pause()
+            assert lista.index == indice_antes, "a seta mexeu na lista com o foco no detalhe"
+            assert detalhe.cursor >= 0, "a seta não moveu o cursor do detalhe"
+
+            await pilot.press("tab")
+            await pilot.pause()
+            await pilot.press("down")
+            await pilot.pause()
+            assert lista.index != indice_antes, "de volta na lista, a seta parou de funcionar"
+
+    asyncio.run(_rodar())
+
+
+def test_enter_abre_coisas_diferentes_em_cada_painel():
+    assert tela(["enter"])[0] == "HistoryScreen"
+    assert tela(["tab", "enter"])[0] == "RunDetailScreen"
+    assert tela(["tab", "down", "enter"])[0] == "RunDetailScreen"
+    # Voltar para a lista devolve o comportamento dela.
+    assert tela(["tab", "tab", "enter"])[0] == "HistoryScreen"
+
+
+def test_detalhe_marca_a_execucao_em_foco():
+    _, sem_foco = tela([])
+    _, com_foco = tela(["tab"])
+    assert "enter abre esta execução" in com_foco
+    assert "enter abre esta execução" not in sem_foco
+
+
+def test_trocar_de_job_zera_o_cursor_do_detalhe():
+    """Senão o cursor apontaria para a execução de outro job."""
+    import asyncio
+
+    from backup_runner.ui.app import BackupRunnerApp
+    from backup_runner.ui.screens.dashboard import DetailPane
+
+    async def _rodar():
+        app = BackupRunnerApp(skip_splash=True)
+        async with app.run_test(size=(100, 32)) as pilot:
+            await pilot.pause()
+            await pilot.press("tab")
+            await pilot.press("down")
+            await pilot.pause()
+            detalhe = app.screen.query_one("#detalhe", DetailPane)
+            assert detalhe.cursor >= 0
+            await pilot.press("tab")
+            await pilot.press("down")
+            await pilot.pause()
+            assert detalhe.cursor == -1, "o cursor do detalhe sobreviveu à troca de job"
+
+    asyncio.run(_rodar())

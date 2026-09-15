@@ -152,6 +152,33 @@ class DetailPane(Static):
         super().__init__(markup=True, **kwargs)
         self.view: JobView | None = None
         self.quadro = 0
+        # Índice da execução em foco dentro do painel. -1 é "nenhuma", que é o
+        # estado enquanto o foco está na lista de jobs à esquerda.
+        self.cursor = -1
+        self.runs: list = []
+
+    @property
+    def tem_foco(self) -> bool:
+        """O painel conta como focado quando ele ou o scroll em volta tem foco."""
+        pai = self.parent
+        return self.has_focus or bool(pai is not None and pai.has_focus)
+
+    def mover(self, passo: int) -> None:
+        if not self.runs:
+            return
+        if self.cursor < 0:
+            self.cursor = 0 if passo > 0 else len(self.runs) - 1
+        else:
+            self.cursor = max(0, min(len(self.runs) - 1, self.cursor + passo))
+        self.refresh()
+
+    def selecionada(self):
+        if 0 <= self.cursor < len(self.runs):
+            return self.runs[self.cursor]
+        return None
+
+    def reset_cursor(self) -> None:
+        self.cursor = -1
 
     def render(self) -> str:
         if self.view is None:
@@ -260,6 +287,7 @@ class DetailPane(Static):
     def _execucoes(self, view: JobView, largura: int, segundos: float | None) -> list[str]:
         ctx = self.app.ctx
         execucoes = ctx.state.runs(job=view.name, limit=4)
+        self.runs = execucoes
         if not execucoes:
             linhas = ["  " + m.body(t("empty.runs_title")), ""]
             if segundos is not None:
@@ -267,7 +295,9 @@ class DetailPane(Static):
             linhas.append("      " + m.key("r", " rodar agora sem esperar"))
             return linhas
         linhas = []
-        for run in execucoes:
+        for i, run in enumerate(execucoes):
+            foco = self.tem_foco and i == self.cursor
+            marca = m.c(T.SYM_HINT, T.PRIMARY) if foco else " "
             simbolo, _, cor = m.badge_parts(run.result)
             quando = run.started_at.strftime("%d/%m %H:%M").ljust(14)
             tamanho = T.format_bytes(run.bytes).ljust(10)
@@ -277,9 +307,18 @@ class DetailPane(Static):
                 if run.destinations_done
                 else (_corta(run.error_cause, 12) if run.error_cause else t("hist.none"))
             )
-            linhas.append("  " + m.c(simbolo, cor) + " " + m.body(quando) + m.muted(tamanho + duracao + destinos))
+            linhas.append(
+                f"{marca} " + m.c(simbolo, cor) + " "
+                + m.body(quando, bold=foco) + m.muted(tamanho + duracao + destinos)
+            )
         linhas.append("")
-        linhas.append(m.muted(t("dash.open_history")))
+        # A dica muda conforme onde o cursor está, porque a mesma tecla faz
+        # coisas diferentes nos dois painéis.
+        if self.tem_foco:
+            linhas.append(m.muted("enter abre esta execução") + m.dim("   tab volta"))
+        else:
+            linhas.append(m.muted(t("dash.open_history")))
+            linhas.append(m.dim("tab entra nas execuções"))
         return linhas
 
     # ------------------------------------------------------------------
@@ -460,12 +499,19 @@ class DashboardScreen(Screen):
             )
         else:
             rodando_agora = self.selecionado.running if self.selecionado else False
-            barra.hints = m.keys(
-                ("↑↓", t("key.move")), ("tab", t("key.panel")), ("enter", t("key.open")),
-                ("n", t("key.new")), ("r", t("key.run"), not rodando_agora), ("p", t("key.pause")),
-                ("d", t("key.delete")), ("/", t("key.search")), ("h", t("key.history")),
-                ("?", t("key.help")),
-            )
+            if self.foco_no_detalhe:
+                barra.hints = m.keys(
+                    ("↑↓", "execução"), ("enter", "abrir execução"), ("tab", "voltar aos jobs"),
+                    ("r", t("key.run"), not rodando_agora), ("h", t("key.history")),
+                    ("?", t("key.help")),
+                )
+            else:
+                barra.hints = m.keys(
+                    ("↑↓", t("key.move")), ("tab", "detalhe"), ("enter", t("key.history")),
+                    ("n", t("key.new")), ("r", t("key.run"), not rodando_agora), ("p", t("key.pause")),
+                    ("d", t("key.delete")), ("/", t("key.search")), ("h", t("key.history")),
+                    ("?", t("key.help")),
+                )
         barra.refresh()
 
     # ------------------------------------------------------------------
@@ -565,14 +611,41 @@ class DashboardScreen(Screen):
         )
 
     # ------------------------------------------------------------------
+    @on(ListView.Selected)
+    def _escolheu_job(self) -> None:
+        # O ListView consome o enter antes do binding da tela, então a
+        # abertura precisa vir do evento dele.
+        self.action_abrir_historico()
+
     @on(ListView.Highlighted)
     def _mudou_selecao(self) -> None:
+        self.query_one("#detalhe", DetailPane).reset_cursor()
         for linha in self.query(JobRow):
             linha.refresh_row()
         self._preencher_detalhe()
         self._preencher_status()
 
+    @property
+    def foco_no_detalhe(self) -> bool:
+        detalhe = self.query_one("#detalhe", DetailPane)
+        return detalhe.tem_foco
+
     def action_mover(self, passo: int) -> None:
+        """As setas andam no painel que tem o foco, não sempre na lista.
+
+        Sem isso, entrar no detalhe pelo tab e apertar seta movia a lista de
+        jobs lá atrás, trocando justamente o conteúdo que a pessoa estava
+        tentando ler.
+        """
+        if self.foco_no_detalhe:
+            detalhe = self.query_one("#detalhe", DetailPane)
+            if detalhe.runs:
+                detalhe.mover(passo)
+                self._preencher_status()
+                return
+            # Sem execuções para percorrer, a seta rola o painel.
+            self.query_one("#detalhe-painel").scroll_relative(y=passo * 2, animate=False)
+            return
         lista = self.query_one("#lista", ListView)
         if passo < 0:
             lista.action_cursor_up()
@@ -584,12 +657,20 @@ class DashboardScreen(Screen):
             self._aba = 1 - self._aba
             self.on_resize()
             return
-        detalhe = self.query_one("#detalhe-painel")
+        painel = self.query_one("#detalhe-painel")
+        alvo = self.query_one("#detalhe", DetailPane)
         lista = self.query_one("#lista", ListView)
-        if detalhe.has_focus_within:
+        if alvo.tem_foco:
+            alvo.reset_cursor()
             lista.focus()
         else:
-            detalhe.focus()
+            painel.focus()
+            # Entrar no painel já põe o cursor na execução mais recente, senão
+            # a primeira seta parece não fazer nada.
+            if alvo.runs and alvo.cursor < 0:
+                alvo.cursor = 0
+        alvo.refresh()
+        self._preencher_status()
 
     # ------------------------------------------------------------------
     def action_novo(self) -> None:
@@ -630,6 +711,14 @@ class DashboardScreen(Screen):
             self._recarregar()
 
     def action_abrir_historico(self) -> None:
+        """Enter abre o que está em foco: a execução, ou o histórico do job."""
+        if self.foco_no_detalhe:
+            run = self.query_one("#detalhe", DetailPane).selecionada()
+            if run is not None:
+                from .run_detail import RunDetailScreen
+
+                self.app.push_screen(RunDetailScreen(run.id))
+                return
         view = self.selecionado
         from .history import HistoryScreen
 
