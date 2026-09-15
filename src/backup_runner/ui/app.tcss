@@ -1,0 +1,188 @@
+/* Estilos globais.
+
+   As cores vêm de $br-*, injetadas por BackupRunnerApp.get_css_variables().
+   O prefixo evita colidir com o design system embutido do Textual, cujos
+   $primary e $surface têm semântica própria nos widgets nativos.
+
+   Painel em repouso tem borda em $br-border; em foco, em $br-primary. Foco é
+   único na tela, então duas bordas primary ao mesmo tempo é bug de estilo. */
+
+Screen {
+    background: $br-bg;
+    color: $br-text;
+}
+
+* {
+    scrollbar-size-vertical: 1;
+    scrollbar-background: $br-bg;
+    scrollbar-color: $br-border;
+    scrollbar-color-hover: $br-primary;
+    scrollbar-color-active: $br-primary;
+}
+
+.panel {
+    border: round $br-border;
+    background: $br-bg;
+    padding: 0 1;
+}
+
+.panel:focus-within {
+    border: round $br-primary;
+}
+
+.panel-title {
+    color: $br-secondary;
+}
+
+.body {
+    height: 1fr;
+}
+
+.row {
+    height: auto;
+}
+
+.muted {
+    color: $br-muted;
+}
+
+.dim {
+    color: $br-disabled;
+}
+
+.center {
+    align: center middle;
+}
+
+.pad {
+    padding: 1 2;
+}
+
+/* Listas ------------------------------------------------------------------ */
+
+ListView {
+    background: $br-bg;
+    border: none;
+    padding: 0;
+}
+
+ListView > ListItem {
+    background: $br-bg;
+    padding: 0 1;
+}
+
+ListView > ListItem.--highlight {
+    background: $br-surface;
+}
+
+ListView:focus > ListItem.--highlight {
+    background: $br-surface;
+}
+
+ListItem > Static {
+    background: transparent;
+}
+
+/* Tabelas ----------------------------------------------------------------- */
+
+DataTable {
+    background: $br-bg;
+    color: $br-text;
+}
+
+DataTable > .datatable--header {
+    background: $br-bg;
+    color: $br-secondary;
+    text-style: none;
+}
+
+DataTable > .datatable--cursor {
+    background: $br-surface;
+    color: $br-text;
+}
+
+DataTable > .datatable--hover {
+    background: $br-bg;
+}
+
+/* Campos ------------------------------------------------------------------ */
+
+Input {
+    background: $br-bg;
+    color: $br-text;
+    border: none;
+    padding: 0 1;
+    height: 1;
+}
+
+Input:focus {
+    background: $br-surface;
+}
+
+Input.-invalid {
+    color: $br-danger;
+}
+
+Input > .input--placeholder {
+    color: $br-disabled;
+}
+
+Label {
+    color: $br-secondary;
+}
+
+/* Modais ------------------------------------------------------------------ */
+
+.modal {
+    background: $br-surface;
+    border: round $br-danger;
+    padding: 1 2;
+    width: 70;
+    height: auto;
+}
+
+.modal-neutral {
+    border: round $br-primary;
+}
+
+ModalScreen {
+    align: center middle;
+    background: $br-bg 60%;
+}
+
+/* Wizard ------------------------------------------------------------------ */
+
+.steps {
+    height: 2;
+    padding: 0 1;
+}
+
+.form-row {
+    height: 1;
+    layout: horizontal;
+}
+
+.form-label {
+    width: 18;
+    color: $br-secondary;
+}
+
+.form-hint {
+    color: $br-disabled;
+    padding: 0 0 0 2;
+}
+
+.field-frame {
+    width: 1fr;
+    layout: horizontal;
+}
+
+.field-mark {
+    width: 2;
+    color: $br-border;
+}
+
+.field-mark-focus {
+    width: 2;
+    color: $br-primary;
+}
