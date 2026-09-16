@@ -184,6 +184,42 @@ class LocalBackend:
 # S3 compatível
 # ----------------------------------------------------------------------------
 
+# Quanto esperar por uma resposta já pedida. Ver o comentário no cliente: é o
+# `CompleteMultipartUpload` de um objeto grande que precisa disto.
+READ_TIMEOUT = 900
+
+# Acima deste tamanho o boto3 parte o arquivo; abaixo, manda de uma vez.
+LIMIAR_MULTIPART = 16 * 1024 * 1024
+
+# O S3 aceita no máximo dez mil partes por objeto.
+MAX_PARTES = 10_000
+
+
+def _transferencia(tamanho: int):
+    """Como partir este arquivo, em função do tamanho dele.
+
+    O padrão do boto3 é parte de 8 MB, que num arquivo de doze gigabytes dá
+    mil e quinhentas partes. Montar mil e quinhentas partes no fim é justamente
+    a chamada que estourou o tempo e custou um backup inteiro.
+
+    Partes de 64 MB derrubam isso para menos de duzentas, e a conta continua
+    valendo para arquivos muito maiores: a parte cresce até caber nas dez mil
+    que o S3 permite. Partes maiores também significam menos requisições, o que
+    numa rede doméstica é menos chance de uma delas falhar.
+    """
+    from boto3.s3.transfer import TransferConfig
+
+    parte = 64 * 1024 * 1024
+    while tamanho / parte > MAX_PARTES:
+        parte *= 2
+    return TransferConfig(
+        multipart_threshold=LIMIAR_MULTIPART,
+        multipart_chunksize=parte,
+        max_concurrency=10,
+        use_threads=True,
+    )
+
+
 class S3Backend:
     def __init__(self, destino: Destination) -> None:
         self.destino = destino
@@ -218,6 +254,21 @@ class S3Backend:
                 # em falha.
                 retries={"max_attempts": 3, "mode": "adaptive"},
                 s3={"addressing_style": estilo_endereco(self.destino.bucket)},
+                # Conectar é rápido ou não é: quinze segundos bastam, e esperar
+                # mais por um endpoint que não responde só atrasa o diagnóstico.
+                connect_timeout=15,
+                # Ler, não. O padrão do botocore é sessenta segundos, e foi ele
+                # que jogou fora um backup de doze gigabytes: as mil e quinhentas
+                # partes subiram em três horas e quarenta e cinco minutos, e aí o
+                # `CompleteMultipartUpload` passou de um minuto montando o objeto
+                # no lado do provedor. O cliente desistiu, o S3Transfer abortou o
+                # multipart, e as três horas e quarenta e cinco viraram nada.
+                #
+                # A montagem final é proporcional ao número de partes, e acontece
+                # inteira dentro de uma única resposta HTTP. Quinze minutos é
+                # folga para um objeto grande sem deixar um destino morto pendurar
+                # o worker por horas.
+                read_timeout=READ_TIMEOUT,
             ),
         )
         return self._cliente
@@ -271,11 +322,15 @@ class S3Backend:
                 if on_progress:
                     on_progress(conta["n"])
 
-            # upload_file faz multipart sozinho acima de 8 MB, com retomada das
-            # partes: um dump de 2 GB numa rede doméstica não recomeça do zero.
+            # upload_file faz multipart sozinho acima do limiar, com retomada
+            # das partes: um dump de 2 GB numa rede doméstica não recomeça do
+            # zero. O tamanho da parte é nosso, e não o padrão de 8 MB, porque
+            # é o número de partes que decide quanto o provedor demora para
+            # montar o objeto no fim.
             cliente.upload_file(
                 str(arquivo), self.destino.bucket, self._chave(prefixo, arquivo.name),
                 Callback=progresso,
+                Config=_transferencia(arquivo.stat().st_size),
             )
             enviados += arquivo.stat().st_size
         return enviados
