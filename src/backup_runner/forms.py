@@ -577,3 +577,72 @@ def _causa_slack(erro: str) -> str:
     if "410" in erro:
         return "o webhook foi revogado"
     return "o Slack não aceitou a mensagem"
+
+
+# ----------------------------------------------------------------------------
+# Avisos de um job
+# ----------------------------------------------------------------------------
+
+def edita_avisos(ctx: Context, job: Job | None = None) -> None:
+    """Quais eventos avisam, e por onde.
+
+    A edição é por canal, marcando todos os eventos de uma vez, em vez de
+    perguntar evento por evento e canal por canal. Com cinco eventos e dois
+    canais, o caminho antigo eram dez perguntas para mudar duas coisas.
+    """
+    from .models import CHANNELS, NOTIFY_EVENTS, Channel, NotifyEvent
+    from . import views
+
+    padrao = ctx.settings.notify_global
+    alvo = job.notify if job is not None else padrao
+    escopo = f"do job {job.name}" if job is not None else "global"
+
+    c.titulo(f"avisos {escopo}")
+    views.matriz_avisos(ctx, job)
+
+    configurados = [ch for ch in CHANNELS if ctx.settings.channel_configured(ch.value)]
+    if not configurados:
+        c.aviso("nenhum canal configurado, então nada avisa ninguém")
+        if prompt.confirma("configurar um canal agora", padrao=True):
+            configura_canais(ctx)
+        return
+
+    while True:
+        opcoes = [(ch.value, f"{ch.value}: escolher o que avisa") for ch in configurados]
+        if job is not None:
+            opcoes.append(("herdar", "voltar tudo ao padrão global"))
+        try:
+            escolha = prompt.escolhe("mudar o quê", opcoes, rotulo_saida="terminei")
+        except prompt.Cancelado:
+            return
+
+        if escolha == "herdar":
+            alvo.cells.clear()
+            _salva_avisos(ctx, job)
+            c.sucesso("o job voltou a seguir o padrão global")
+            views.matriz_avisos(ctx, job)
+            continue
+
+        canal = next(ch for ch in CHANNELS if ch.value == escolha)
+        marcados = [
+            ev.value for ev in NOTIFY_EVENTS if alvo.resolve(ev, canal, padrao)
+        ]
+        escolhidos = prompt.marca_varios(
+            f"o que avisa por {canal.value}",
+            [(ev.value, views._nome_evento(ev)) for ev in NOTIFY_EVENTS],
+            marcados=marcados,
+        )
+        for evento in NOTIFY_EVENTS:
+            alvo.set(evento, canal, evento.value in escolhidos)
+
+        _salva_avisos(ctx, job)
+        c.sucesso(f"avisos de {canal.value} salvos")
+        views.matriz_avisos(ctx, job)
+
+
+def _salva_avisos(ctx: Context, job: Job | None) -> None:
+    if job is None:
+        ctx.settings.save()
+    else:
+        ctx.jobs.put(job)
+    ctx.refresh()

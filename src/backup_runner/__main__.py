@@ -225,14 +225,23 @@ def cmd_dest(args: argparse.Namespace) -> int:
 # ----------------------------------------------------------------------------
 
 def cmd_notify(args: argparse.Namespace) -> int:
-    from . import views
+    from . import forms, views
 
     ctx = _ctx()
     job = ctx.jobs.get(args.job) if args.job else None
     if args.job and job is None:
         c.erro(f"não existe job chamado {args.job}")
+        c.nota("veja os nomes com: backup-runner jobs")
         return 1
+
+    if args.editar:
+        forms.edita_avisos(ctx, job)
+        return 0
+
     views.matriz_avisos(ctx, job)
+    if job is None:
+        c.nota("de um job: backup-runner notify --job <nome>")
+    c.nota("para mudar: backup-runner notify --editar" + (f" --job {job.name}" if job else ""))
     return 0
 
 
@@ -313,22 +322,79 @@ def cmd_worker(args: argparse.Namespace) -> int:
 
 
 def cmd_install(args: argparse.Namespace) -> int:
-    from tempfile import NamedTemporaryFile
-
-    from .health import install_tick, supervisor_conf, tick_installed
+    """Instala o agendamento: a linha do cron e o serviço do worker."""
+    from . import service
+    from .health import install_tick, tick_installed
 
     if args.check:
-        instalado = tick_installed()
-        (c.sucesso if instalado else c.erro)(
-            "tick no crontab" if instalado else "tick não está no crontab"
-        )
-        return 0 if instalado else 1
+        return _install_check()
 
     ok, mensagem = install_tick()
     (c.sucesso if ok else c.erro)(f"crontab: {mensagem}")
 
+    estado = service.status()
+    if estado.rodando:
+        c.sucesso(f"worker já de pé por {estado.gerenciador}")
+        return 0
+
+    escolha = args.gerenciador
+    if escolha is None:
+        escolha = _escolhe_gerenciador(service)
+        if escolha is None:
+            return 1
+
+    if escolha == "systemd":
+        return _instala_systemd(service)
+    return _instala_supervisord(service)
+
+
+def _escolhe_gerenciador(service) -> str | None:
+    opcoes = []
+    if service.systemd_disponivel():
+        opcoes.append(("systemd", "systemd de usuário   sem sudo, isolado, sobe no boot"))
+    opcoes.append(("supervisord", "supervisord          precisa de sudo, compartilhado"))
+
+    if len(opcoes) == 1:
+        c.nota("systemd de usuário não disponível nesta sessão")
+        return "supervisord"
+
+    print()
+    c.nota("o systemd de usuário não precisa de sudo e é só seu: um serviço")
+    c.nota("quebrado de outro projeto não impede o backup de subir")
+    try:
+        return prompt.escolhe("como manter o worker de pé", opcoes, padrao="systemd")
+    except prompt.Cancelado:
+        c.info("cancelado")
+        return None
+
+
+def _instala_systemd(service) -> int:
+    ok, passos = service.systemd_instala()
+    for passo in passos:
+        (c.aviso if passo.startswith("!") else c.sucesso)(passo.lstrip("! "))
+    if not ok:
+        c.erro("o serviço não subiu")
+        return 1
+
+    estado = service.systemd_status()
+    if estado.rodando:
+        c.sucesso(f"worker rodando, pid {estado.pid}")
+    else:
+        c.aviso(f"a unidade foi instalada mas o serviço não subiu: {estado.mensagem}")
+        c.nota(f"veja o motivo com: systemctl --user status {service.UNIDADE}")
+        return 1
+
+    print()
+    c.nota("para acompanhar: journalctl --user -u backup-runner -f")
+    c.nota("para parar:      systemctl --user stop backup-runner")
+    return 0
+
+
+def _instala_supervisord(service) -> int:
+    from tempfile import NamedTemporaryFile
+
     with NamedTemporaryFile("w", suffix=".conf", prefix=f"{APP_SLUG}-", delete=False) as f:
-        f.write(supervisor_conf())
+        f.write(service.supervisor_conf())
         caminho = f.name
 
     print()
@@ -336,7 +402,31 @@ def cmd_install(args: argparse.Namespace) -> int:
     print(f"    cat {caminho}")
     print(f"    sudo cp {caminho} /etc/supervisor/conf.d/{APP_SLUG}.conf")
     print("    sudo supervisorctl reread && sudo supervisorctl update")
-    return 0 if ok else 1
+    print()
+    c.nota("se o supervisorctl reclamar de socket inexistente, o daemon não está")
+    c.nota("de pé. um único .conf inválido em /etc/supervisor/conf.d/ derruba")
+    c.nota("todos os programas dele; veja qual com:")
+    print("    sudo systemctl status supervisor")
+    return 0
+
+
+def _install_check() -> int:
+    from . import service
+    from .health import tick_installed
+
+    tick = tick_installed()
+    (c.sucesso if tick else c.erro)(
+        "tick no crontab" if tick else "tick não está no crontab"
+    )
+    estado = service.status()
+    if estado.rodando:
+        c.sucesso(f"worker rodando por {estado.gerenciador}, pid {estado.pid or '?'}")
+    else:
+        c.erro(f"worker: {estado.mensagem}")
+        if estado.conserto:
+            for linha in estado.conserto.splitlines():
+                c.nota(linha)
+    return 0 if (tick and estado.rodando) else 1
 
 
 def cmd_demo(args: argparse.Namespace) -> int:
@@ -540,7 +630,8 @@ def build_parser() -> argparse.ArgumentParser:
     s.set_defaults(func=cmd_dest)
 
     s = sub.add_parser("notify", help="quais eventos avisam, e por onde")
-    s.add_argument("--job", default=None)
+    s.add_argument("--job", default=None, help="os avisos de um job, em vez do global")
+    s.add_argument("--editar", action="store_true", help="mudar, em vez de só mostrar")
     s.set_defaults(func=cmd_notify)
 
     s = sub.add_parser("health", help="diagnóstico do sistema")
@@ -568,8 +659,10 @@ def build_parser() -> argparse.ArgumentParser:
                    help="segundos entre consultas à fila")
     s.set_defaults(func=cmd_worker)
 
-    s = sub.add_parser("install", help="instala o agendamento: cron e supervisord")
-    s.add_argument("--check", action="store_true")
+    s = sub.add_parser("install", help="instala o agendamento: cron e worker")
+    s.add_argument("--check", action="store_true", help="só confere, não instala")
+    s.add_argument("--gerenciador", choices=["systemd", "supervisord"], default=None,
+                   help="como manter o worker de pé (sem isto, pergunta)")
     s.set_defaults(func=cmd_install)
 
     s = sub.add_parser("demo", help="popula dados de demonstração")

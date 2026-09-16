@@ -95,6 +95,7 @@ def menu_jobs(ctx: Context) -> None:
                 ("rodar", "rodar um job agora"),
                 ("pausar", "pausar ou retomar"),
                 ("editar", "editar"),
+                ("avisos", "avisos deste job"),
                 ("apagar", "apagar"),
             ] + opcoes
 
@@ -133,6 +134,10 @@ def menu_jobs(ctx: Context) -> None:
                 forms.job_mysql(ctx, view.job)
             else:
                 forms.job_arquivos(ctx, view.job)
+        elif escolha == "avisos":
+            moldura(ctx, "jobs", view.name, "avisos")
+            forms.edita_avisos(ctx, view.job)
+            prompt.pausa("Enter volta")
         elif escolha == "apagar":
             _apaga_job(ctx, view)
 
@@ -292,57 +297,27 @@ def _escolhe_destino(ctx: Context):
 
 def menu_avisos(ctx: Context) -> None:
     moldura(ctx, "avisos")
-    alvo = prompt.escolhe(
-        "avisos de quem",
-        [("global", "o padrão global, que todo job herda")]
-        + [(v.name, f"o job {v.name}") for v in ctx.views]
-        + [("canais", "configurar os canais (SMTP e Slack)")],
-        rotulo_saida="voltar",
-    )
+    try:
+        alvo = prompt.escolhe(
+            "avisos de quem",
+            [("global", "o padrão global, que todo job herda")]
+            + [(v.name, f"o job {v.name}") for v in ctx.views]
+            + [("canais", "configurar os canais (SMTP e Slack)")],
+            rotulo_saida="voltar",
+        )
+    except prompt.Cancelado:
+        return
+
     if alvo == "canais":
         forms.configura_canais(ctx)
         ctx.refresh()
         prompt.pausa("Enter volta")
         return
+
     job = None if alvo == "global" else ctx.jobs.get(alvo)
-    views.matriz_avisos(ctx, job)
-
-    faltando = [
-        nome for nome in ("email", "slack")
-        if not ctx.settings.channel_configured(nome)
-    ]
-    if faltando:
-        c.aviso(f"sem configuração: {', '.join(faltando)}")
-        c.nota("um evento marcado num canal não configurado não avisa ninguém")
-        if prompt.confirma("configurar agora", padrao=True):
-            forms.configura_canais(ctx)
-            ctx.refresh()
-            return
-
-    if not prompt.confirma("mudar algum aviso", padrao=False):
-        return
-
-    from .models import CHANNELS, NOTIFY_EVENTS
-
-    evento_nome = prompt.escolhe(
-        "qual evento",
-        [(e.value, views._nome_evento(e)) for e in NOTIFY_EVENTS],
-    )
-    evento = next(e for e in NOTIFY_EVENTS if e.value == evento_nome)
-    canal_nome = prompt.escolhe("qual canal", [(c_.value, c_.value) for c_ in CHANNELS])
-    canal = next(c_ for c_ in CHANNELS if c_.value == canal_nome)
-
-    padrao = ctx.settings.notify_global
-    matriz = padrao if job is None else job.notify
-    atual = matriz.resolve(evento, canal, padrao)
-    novo = prompt.confirma(f"avisar por {canal.value} quando {views._nome_evento(evento)}", padrao=not atual)
-    matriz.set(evento, canal, novo)
-
-    if job is None:
-        ctx.settings.save()
-    else:
-        ctx.jobs.put(job)
-    c.sucesso("aviso atualizado")
+    moldura(ctx, "avisos", alvo)
+    forms.edita_avisos(ctx, job)
+    prompt.pausa("Enter volta")
 
 
 # ----------------------------------------------------------------------------

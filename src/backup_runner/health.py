@@ -110,7 +110,7 @@ def uninstall_tick() -> tuple[bool, str]:
 
 
 # ----------------------------------------------------------------------------
-# worker no supervisord
+# worker
 # ----------------------------------------------------------------------------
 
 @dataclass
@@ -118,50 +118,32 @@ class WorkerStatus:
     running: bool = False
     pid: int | None = None
     uptime: str = ""
-    known: bool = False   # o supervisord conhece o programa
+    known: bool = False
     message: str = ""
+    manager: str = ""
+    fix: str = ""
 
 
 def worker_status() -> WorkerStatus:
-    if not shutil.which("supervisorctl"):
-        return WorkerStatus(message="supervisorctl não está no PATH")
-    try:
-        proc = subprocess.run(
-            ["supervisorctl", "status", SUPERVISOR_PROGRAM],
-            capture_output=True, text=True, timeout=5,
-        )
-    except subprocess.TimeoutExpired:
-        return WorkerStatus(message="supervisorctl não respondeu")
-    saida = (proc.stdout or proc.stderr).strip()
-    if "no such process" in saida.lower() or not saida:
-        return WorkerStatus(known=False, message="programa não cadastrado no supervisord")
-    partes = saida.split()
-    estado = partes[1] if len(partes) > 1 else ""
-    status = WorkerStatus(known=True, running=estado == "RUNNING", message=saida)
-    if "pid" in saida:
-        try:
-            pedaco = saida.split("pid", 1)[1].strip()
-            status.pid = int(pedaco.split(",")[0])
-            if "uptime" in pedaco:
-                status.uptime = pedaco.split("uptime", 1)[1].strip()
-        except (ValueError, IndexError):
-            pass
-    return status
+    """Pergunta ao módulo de serviço, que conhece systemd e supervisord."""
+    from . import service
+
+    estado = service.status()
+    return WorkerStatus(
+        running=estado.rodando,
+        pid=estado.pid,
+        uptime=estado.desde,
+        known=estado.instalado,
+        message=estado.mensagem,
+        manager=estado.gerenciador,
+        fix=estado.conserto,
+    )
 
 
 def supervisor_conf() -> str:
-    binario = shutil.which(APP_SLUG) or str(Path.home() / ".local" / "bin" / APP_SLUG)
-    return (
-        f"[program:{SUPERVISOR_PROGRAM}]\n"
-        f"command={binario} worker\n"
-        f"user={Path.home().name}\n"
-        f'environment=HOME="{Path.home()}"\n'
-        "autostart=true\n"
-        "autorestart=true\n"
-        "startsecs=5\n"
-        f"stdout_logfile={data_dir()}/worker.log\n"
-        f"stderr_logfile={data_dir()}/worker.err.log\n"
-    )
+    from . import service
+
+    return service.supervisor_conf()
 
 
 # ----------------------------------------------------------------------------
@@ -219,7 +201,8 @@ def collect(destinations: list | None = None, next_job: tuple[str, int] | None =
 
     worker = worker_status()
     if worker.running:
-        nivel, detalhe = Level.OK, t("health.worker_ok", pid=worker.pid or 0, t=worker.uptime or "?")
+        nivel = Level.OK
+        detalhe = f"rodando por {worker.manager}, pid {worker.pid or '?'}"
     elif worker.known:
         nivel, detalhe = Level.FAIL, worker.message
     else:
@@ -227,12 +210,11 @@ def collect(destinations: list | None = None, next_job: tuple[str, int] | None =
     itens.append(
         HealthItem(
             key="worker",
-            title=t("health.worker"),
+            title="worker",
             level=nivel,
             detail=detalhe,
-            why="" if worker.running else t("health.worker_conf"),
-            fix_command="" if worker.running else f"sudo supervisorctl reread && sudo supervisorctl update",
-            extra=[t("health.worker_conf")] if worker.running else [],
+            why="" if worker.running else "sem o worker, a fila enche e nada é executado",
+            fix_command="" if worker.running else (worker.fix or f"{APP_SLUG} install"),
         )
     )
 

@@ -146,10 +146,36 @@ sudo supervisorctl reread && sudo supervisorctl update
 ### Agendamento
 
 O `backup-runner install` é outra coisa: ele não instala o programa, instala o
-**agendamento**. Escreve a linha no crontab do próprio usuário sozinho, porque
-isso não precisa de sudo, e gera o conf do supervisord para você aplicar. O
-programa nunca chama `sudo` por conta própria, já que instalar um serviço que
-roda para sempre merece ser lido antes.
+**agendamento**. Escreve a linha no crontab e sobe o worker.
+
+Para o worker há dois caminhos, e ele pergunta qual:
+
+**systemd de usuário** (sugerido): não precisa de sudo, sobe com a sessão, e
+com `loginctl enable-linger` sobe no boot mesmo sem login. É isolado: um
+serviço quebrado de outro projeto não impede o backup de subir.
+
+**supervisord**: costuma já existir na máquina, mas é compartilhado, e um
+único `.conf` inválido em `/etc/supervisor/conf.d/` derruba o daemon inteiro,
+levando junto todos os programas dele. O `install` gera o arquivo e imprime as
+linhas de sudo para você aplicar; o programa nunca chama `sudo` sozinho.
+
+```sh
+backup-runner install                        # pergunta qual
+backup-runner install --gerenciador systemd  # sem perguntar
+backup-runner install --check                # só confere
+```
+
+### S3 compatível
+
+Dois detalhes que derrubam a configuração e não são óbvios:
+
+- **O endpoint é o da região**, não o do bucket. O painel da DigitalOcean
+  mostra `meu-bucket.nyc3.digitaloceanspaces.com`, mas o campo espera
+  `nyc3.digitaloceanspaces.com`. O programa tira o bucket se ele vier junto.
+- **Bucket com ponto no nome** força o endereçamento por caminho. No modo
+  normal o bucket vira subdomínio, e o certificado curinga do provedor cobre um
+  nível só: `a.b.nyc3.provedor.com` não casa com `*.nyc3.provedor.com`. O
+  programa detecta o ponto e troca o modo sozinho.
 
 ## Comandos
 

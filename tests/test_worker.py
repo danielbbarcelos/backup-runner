@@ -345,3 +345,56 @@ def test_job_sumido_no_meio_da_fila_nao_derruba_o_worker():
 
     assert not resultado.ok
     assert resultado.run.result is RunResult.FAILED
+
+
+# ----------------------------------------------------------------------------
+# Endereçamento S3
+# ----------------------------------------------------------------------------
+
+def test_endpoint_com_o_bucket_junto_e_corrigido():
+    """O painel da DigitalOcean mostra a URL do bucket, e é ela que se copia.
+
+    Com o bucket dentro do endpoint, o cliente monta `bucket.bucket.região` e
+    nada funciona.
+    """
+    from backup_runner.destinations import normaliza_endpoint
+
+    assert normaliza_endpoint(
+        "dbmv.cold-storage.nyc3.digitaloceanspaces.com", "dbmv.cold-storage"
+    ) == "nyc3.digitaloceanspaces.com"
+    assert normaliza_endpoint(
+        "https://meubucket.nyc3.digitaloceanspaces.com/", "meubucket"
+    ) == "nyc3.digitaloceanspaces.com"
+    # Endpoint já correto continua igual.
+    assert normaliza_endpoint(
+        "nyc3.digitaloceanspaces.com", "meubucket"
+    ) == "nyc3.digitaloceanspaces.com"
+    # Bucket que por acaso começa igual a um pedaço do host não é removido.
+    assert normaliza_endpoint("nyc3.digitaloceanspaces.com", "nyc") == "nyc3.digitaloceanspaces.com"
+
+
+def test_bucket_com_ponto_usa_caminho_em_vez_de_subdominio():
+    """O certificado curinga do provedor cobre um nível só.
+
+    Um bucket `a.b` viraria `a.b.nyc3.provedor.com`, que `*.nyc3.provedor.com`
+    não cobre, e a conexão morre em validação de certificado.
+    """
+    from backup_runner.destinations import estilo_endereco
+
+    assert estilo_endereco("dbmv.cold-storage") == "path"
+    assert estilo_endereco("backups.empresa.com") == "path"
+    assert estilo_endereco("meubucket") == "virtual"
+    assert estilo_endereco("meu-bucket-2026") == "virtual"
+
+
+def test_erro_de_certificado_explica_o_motivo():
+    from backup_runner.destinations import _causa_s3
+
+    erro = Exception(
+        "SSL validation failed for https://a.b.nyc3.digitaloceanspaces.com/ "
+        "hostname 'a.b.nyc3.digitaloceanspaces.com' doesn't match either of "
+        "'*.nyc3.digitaloceanspaces.com'"
+    )
+    causa = _causa_s3(erro)
+    assert "certificado" in causa
+    assert "ponto" in causa or "endpoint" in causa

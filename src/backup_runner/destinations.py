@@ -34,6 +34,37 @@ class DestinationError(Exception):
     pass
 
 
+def normaliza_endpoint(endpoint: str, bucket: str) -> str:
+    """Tira o bucket do endpoint, quando ele veio junto.
+
+    O painel da DigitalOcean mostra a URL completa do bucket
+    (`meu-bucket.nyc3.digitaloceanspaces.com`), e é natural copiar aquilo para
+    o campo de endpoint. Mas o cliente espera o endpoint da região: com o
+    bucket junto, ele monta `meu-bucket.meu-bucket.nyc3...` e nada funciona.
+    """
+    limpo = endpoint.strip().rstrip("/")
+    for prefixo in ("https://", "http://"):
+        if limpo.startswith(prefixo):
+            limpo = limpo[len(prefixo):]
+    if bucket and limpo.startswith(f"{bucket}."):
+        limpo = limpo[len(bucket) + 1:]
+    return limpo
+
+
+def estilo_endereco(bucket: str) -> str:
+    """`path` quando o bucket tem ponto no nome, `virtual` no resto.
+
+    No endereçamento virtual, o bucket vira subdomínio do endpoint. Um bucket
+    chamado `dbmv.cold-storage` produz `dbmv.cold-storage.nyc3.digitalocean...`,
+    e o certificado curinga do provedor (`*.nyc3.digitalocean...`) cobre apenas
+    um nível, então a conexão é recusada por nome que não confere.
+
+    Com `path`, o bucket vai no caminho e o host continua sendo o da região,
+    que o certificado cobre.
+    """
+    return "path" if "." in bucket else "virtual"
+
+
 @dataclass
 class TestResult:
     ok: bool
@@ -171,7 +202,7 @@ class S3Backend:
         if not (self.destino.access_key and segredo):
             raise DestinationError("faltam as credenciais deste destino")
 
-        endpoint = self.destino.endpoint
+        endpoint = normaliza_endpoint(self.destino.endpoint, self.destino.bucket)
         if endpoint and not endpoint.startswith("http"):
             endpoint = f"https://{endpoint}"
 
@@ -181,9 +212,13 @@ class S3Backend:
             region_name=self.destino.region or None,
             aws_access_key_id=self.destino.access_key,
             aws_secret_access_key=segredo,
-            # Três tentativas no modo adaptativo já lidam com o 503 ocasional
-            # de um Spaces ocupado, sem transformar cada soluço em falha.
-            config=Config(retries={"max_attempts": 3, "mode": "adaptive"}),
+            config=Config(
+                # Três tentativas no modo adaptativo já lidam com o 503
+                # ocasional de um Spaces ocupado, sem transformar cada soluço
+                # em falha.
+                retries={"max_attempts": 3, "mode": "adaptive"},
+                s3={"addressing_style": estilo_endereco(self.destino.bucket)},
+            ),
         )
         return self._cliente
 
@@ -199,8 +234,17 @@ class S3Backend:
             cliente.put_object(Bucket=self.destino.bucket, Key=chave, Body=b"backup-runner")
             cliente.delete_object(Bucket=self.destino.bucket, Key=chave)
         except DestinationError as exc:
-            return TestResult(False, str(exc), tried=f"conectar em {self.destino.location()}",
-                              cause=str(exc), fix="abra o destino e preencha as credenciais")
+            falta_lib = "boto3" in str(exc)
+            return TestResult(
+                False, str(exc),
+                tried=f"conectar em {self.destino.location()}",
+                cause=str(exc),
+                fix=(
+                    "reinstale o programa: backup-runner self reinstall --limpo"
+                    if falta_lib
+                    else "abra o destino e preencha a chave e o secret"
+                ),
+            )
         except Exception as exc:
             return TestResult(
                 False, str(exc),
@@ -274,6 +318,11 @@ def _resumo_erro(exc: Exception) -> str:
 
 def _causa_s3(exc: Exception) -> str:
     texto = str(exc)
+    if "SSL validation failed" in texto or "hostname" in texto and "doesn't match" in texto:
+        return (
+            "o nome do host não bate com o certificado do provedor; "
+            "costuma ser bucket com ponto no nome, ou o bucket repetido no endpoint"
+        )
     if "SignatureDoesNotMatch" in texto:
         return "a secret key não confere"
     if "InvalidAccessKeyId" in texto:
