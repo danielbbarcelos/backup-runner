@@ -260,7 +260,7 @@ class DumpResult:
 def run_dump(
     request: DumpRequest,
     *,
-    on_progress: Callable[[int], None] | None = None,
+    on_progress: Callable[[int, int], None] | None = None,
     on_phase: Callable[[str], None] | None = None,
 ) -> DumpResult:
     """Roda o mysqldump em duas passadas, comprimindo em fluxo.
@@ -293,7 +293,7 @@ def run_dump(
     if on_progress is not None:
         watcher = threading.Thread(
             target=_stream_size_watcher,
-            args=(destino, stop_event, on_progress),
+            args=(destino, stop_event, on_progress, contagem),
             daemon=True,
         )
         watcher.start()
@@ -413,14 +413,21 @@ def _passada(args: list[str], saida, log, contagem: dict) -> None:
 def _stream_size_watcher(
     path: Path,
     stop_event: threading.Event,
-    on_tick: Callable[[int], None],
+    on_tick: Callable[[int, int], None],
+    contagem: dict,
 ) -> None:
+    """Avisa de fora quanto já saiu, em bytes crus e em bytes gravados.
+
+    Os dois números são diferentes e ambos importam: o cru é o que dá para
+    comparar com o tamanho do banco no information_schema, e portanto o que
+    vira porcentagem; o gravado é o arquivo que está crescendo no disco.
+    """
     while not stop_event.is_set():
         try:
             size = path.stat().st_size
         except FileNotFoundError:
             size = 0
-        on_tick(size)
+        on_tick(contagem["cru"], size)
         stop_event.wait(0.5)
 
 

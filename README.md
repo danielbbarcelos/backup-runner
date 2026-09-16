@@ -42,6 +42,44 @@ atrasada ainda roda, marcada como atrasada. Fora, é registrada como perdida e
 o aviso sai: um backup de sábado tirado na segunda é só mais uma cópia de
 segunda, não o dado de sábado.
 
+### Acompanhar um backup grande
+
+Um job de doze gigabytes passa horas entre "começou" e "terminou", e durante
+essas horas a pergunta é sempre a mesma: aquilo anda?
+
+```
+backup-runner watch
+```
+
+```
+em execução: file-manager-localhost
+  etapa          enviando  spaces: nyc3/backups
+  progresso      ██████████████░░░░░░░░░░ 56.4%  6,4 GB de 11,4 GB
+  tempo          1h 42min até aqui, 1,1 MB/s, faltam ~1h 18min
+  prazo          limite de 240 min, 2h 17min restantes
+  sinal          ✓ há 0s
+```
+
+O comando sai sozinho quando a execução acaba, mostrando o desfecho completo.
+O mesmo bloco aparece em `backup-runner status` e no menu, como primeiro item,
+enquanto houver algo rodando.
+
+Cada linha responde a uma pergunta diferente:
+
+- **etapa** distingue medir de ler, de comprimir, de enviar. Um job parado em
+  "medindo" está percorrendo diretório; parado em "enviando" está na rede.
+- **progresso** tem denominador de verdade: o arquivamento percorre a árvore
+  antes de começar, e o dump soma o tamanho das tabelas no `information_schema`.
+  No dump a porcentagem é estimada e o texto em SQL costuma ser maior que o dado
+  em disco, então ela satura em `>99%` em vez de mentir.
+- **prazo** compara o ritmo atual com o timeout do job. Ver que sobram vinte
+  minutos de prazo para uma hora de envio permite aumentar o timeout antes de
+  perder o trabalho.
+- **sinal** é a batida de coração do worker. Silêncio longo com o processo vivo
+  é lentidão; silêncio longo com o processo morto é uma execução órfã, e o tick
+  a marca como falha no minuto seguinte, para ela não bloquear os próximos
+  backups fingindo que ainda roda.
+
 ### Compressão
 
 Sempre, e em fluxo. O `mysqldump` escreve direto no gzip, então o SQL cru nunca
@@ -194,6 +232,7 @@ menu e tudo é automatizável.
 | `backup-runner job <nome> --pausar` | pausa ou retoma |
 | `backup-runner job <nome> --apagar` | apaga, pedindo o nome digitado |
 | `backup-runner run <nome>` | põe um job na fila agora |
+| `backup-runner watch` | acompanha ao vivo o backup em execução |
 | `backup-runner history` | execuções (`--job`, `--falhas`, `--dias`) |
 | `backup-runner run-info <nº>` | detalhe de uma execução |
 | `backup-runner retry <nº>` | reenvia o artefato de uma execução pendente |

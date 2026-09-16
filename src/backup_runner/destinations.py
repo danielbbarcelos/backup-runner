@@ -262,11 +262,14 @@ class S3Backend:
         for arquivo in sorted(pasta.iterdir()):
             if not arquivo.is_file():
                 continue
-            acumulado = enviados
+            # O boto3 entrega o tamanho do bloco, não o total já enviado (o
+            # paramiko faz o contrário), então quem soma é este contador.
+            corrente = {"n": enviados}
 
-            def progresso(n: int, base=acumulado) -> None:
+            def progresso(bloco: int, conta=corrente) -> None:
+                conta["n"] += bloco
                 if on_progress:
-                    on_progress(base + n)
+                    on_progress(conta["n"])
 
             # upload_file faz multipart sozinho acima de 8 MB, com retomada das
             # partes: um dump de 2 GB numa rede doméstica não recomeça do zero.

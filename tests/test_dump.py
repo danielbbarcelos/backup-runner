@@ -122,7 +122,7 @@ def test_progresso_acompanha_o_arquivo(tmp_path, falso_mysqldump, monkeypatch):
 
     mysql.run_dump(
         pedido(tmp_path),
-        on_progress=vistos.append,
+        on_progress=lambda cru, gravado: vistos.append(gravado),
         on_phase=fases.append,
     )
     assert "dump" in fases

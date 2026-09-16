@@ -15,6 +15,7 @@ from __future__ import annotations
 import datetime as dt
 import hashlib
 import json
+import os
 import shutil
 import signal
 import time
@@ -48,6 +49,58 @@ class Resultado:
     run: Run
     ok: bool
     mensagem: str = ""
+
+
+class Progresso:
+    """Conta para fora o que está acontecendo aqui dentro.
+
+    Um job de doze gigabytes leva quarenta minutos, e durante esses quarenta
+    minutos o `status` só sabia dizer "rodando". Quem olhava não tinha como
+    distinguir um backup andando de um worker travado. Cada chamada aqui grava
+    a etapa, o quanto já foi e a hora do último sinal de vida, e é desse
+    carimbo de hora que o `status` deduz que um worker morreu.
+
+    A escrita é limitada a uma por segundo. O watcher do dump chama isto duas
+    vezes por segundo e o tar a cada cem arquivos, o que num diretório grande
+    dá centenas de chamadas por segundo; um UPDATE em cada uma faria o SQLite
+    virar o gargalo do backup que ele só deveria estar observando.
+
+    Um progresso que falha nunca derruba o job: o backup é o trabalho, isto
+    aqui é a legenda.
+    """
+
+    def __init__(self, estado: State, run_id: int, *, intervalo: float = 1.0) -> None:
+        self.estado, self.run_id, self.intervalo = estado, run_id, intervalo
+        self.stage, self.label = "iniciando", ""
+        self.done = self.total = 0
+        self._ultima = 0.0
+
+    def etapa(self, stage: str, label: str = "", *, total: int = 0) -> None:
+        """Troca de etapa. Sempre escreve, porque etapa nova é notícia."""
+        self.stage, self.label, self.done, self.total = stage, label, 0, total
+        self._grava()
+
+    def anda(self, done: int, total: int | None = None, label: str | None = None) -> None:
+        """Avanço dentro da etapa atual, escrito no máximo uma vez por segundo."""
+        self.done = done
+        if total is not None:
+            self.total = total
+        if label is not None:
+            self.label = label
+        agora = time.monotonic()
+        if agora - self._ultima < self.intervalo:
+            return
+        self._grava()
+
+    def _grava(self) -> None:
+        self._ultima = time.monotonic()
+        try:
+            self.estado.progresso(
+                self.run_id, stage=self.stage, done=self.done,
+                total=self.total, label=self.label, pid=os.getpid(),
+            )
+        except Exception:  # noqa: BLE001 - legenda quebrada não cancela backup
+            pass
 
 
 # ----------------------------------------------------------------------------
@@ -118,11 +171,13 @@ def executa(job: Job, estado: State, *, atrasado: bool = False) -> Resultado:
     pasta = staging_dir() / job.name / run.folder
     pasta.mkdir(parents=True, exist_ok=True)
     limite = inicio + dt.timedelta(minutes=job.timeout_minutes)
+    prog = Progresso(estado, run.id)
+    prog.etapa("preparando", job.name)
 
     try:
-        _produz(job, run, pasta, limite)
+        _produz(job, run, pasta, limite, prog)
         _escreve_manifest(run, pasta)
-        _envia(job, run, pasta, estado)
+        _envia(job, run, pasta, estado, prog, limite)
     except mysql.MySQLError as exc:
         return _falha(run, estado, Stage.DUMP, exc, job)
     except archive.ArchiveError as exc:
@@ -143,27 +198,30 @@ def executa(job: Job, estado: State, *, atrasado: bool = False) -> Resultado:
         _retencao(job, run)
         _limpa_staging(job, pasta, run)
 
+    prog.etapa("concluído", run.artifact or "")
     run.log.append((run.finished_at.strftime("%H:%M:%S"), "ok", "execução concluída"))
     estado.update_run(run)
     _avisa(job, run)
     return Resultado(run, run.result in (RunResult.OK, RunResult.LATE))
 
 
-def _produz(job: Job, run: Run, pasta: Path, limite: dt.datetime) -> None:
+def _produz(job: Job, run: Run, pasta: Path, limite: dt.datetime, prog: Progresso) -> None:
     """Gera o artefato no staging, comprimindo em fluxo."""
     if job.kind is SourceKind.MYSQL:
-        _dump(job, run, pasta, limite)
+        _dump(job, run, pasta, limite, prog)
     else:
-        _arquiva(job, run, pasta, limite)
+        _arquiva(job, run, pasta, limite, prog)
 
 
-def _dump(job: Job, run: Run, pasta: Path, limite: dt.datetime) -> None:
+def _dump(job: Job, run: Run, pasta: Path, limite: dt.datetime, prog: Progresso) -> None:
     fonte: MySQLSource = job.source  # type: ignore[assignment]
     conexao = mysql.Connection(
         host=fonte.host, port=fonte.port, user=fonte.user,
         password=decrypt(fonte.password_enc) or "", database=fonte.database,
     )
-    tabelas = [t.name for t in mysql.list_tables_info(conexao)]
+    prog.etapa("lendo tabelas", fonte.database)
+    info = mysql.list_tables_info(conexao)
+    tabelas = [t.name for t in info]
     por_regex, por_mao = fonte.resolve_ignored(tabelas)
     run.ignored_regex, run.ignored_manual = por_regex, por_mao
     ignoradas = sorted(set(por_regex) | set(por_mao))
@@ -173,6 +231,14 @@ def _dump(job: Job, run: Run, pasta: Path, limite: dt.datetime) -> None:
         f"{len(tabelas)} tabelas, {len(ignoradas)} sem dados",
     ))
 
+    # O information_schema dá o tamanho das tabelas que vão sair com dados, e é
+    # daí que sai a porcentagem. É estimativa: o SQL de texto costuma ser maior
+    # que o dado em disco, então o número passa de 100% em vez de mentir para
+    # baixo, e a barra trata isso.
+    fora = set(ignoradas)
+    estimado = sum(t.bytes for t in info if t.name not in fora and not t.is_view)
+    prog.etapa("dump", f"{len(tabelas) - len(ignoradas)} tabelas", total=estimado)
+
     resultado = mysql.run_dump(
         mysql.DumpRequest(
             connection=conexao,
@@ -181,7 +247,12 @@ def _dump(job: Job, run: Run, pasta: Path, limite: dt.datetime) -> None:
             log_file=pasta / "dump.log",
             compress=True,
         ),
-        on_progress=lambda _b: _checa_prazo(limite),
+        on_progress=lambda cru, _gravado: (_checa_prazo(limite), prog.anda(cru)),
+        on_phase=lambda fase: prog.etapa(
+            "dump" if fase == "dump" else "estrutura",
+            f"{len(tabelas) - len(ignoradas)} tabelas" if fase == "dump"
+            else f"{len(ignoradas)} ignoradas", total=estimado if fase == "dump" else 0,
+        ),
     )
     run.artifact = resultado.output_file.name
     run.bytes = resultado.bytes_written
@@ -199,8 +270,19 @@ def _dump(job: Job, run: Run, pasta: Path, limite: dt.datetime) -> None:
     ))
 
 
-def _arquiva(job: Job, run: Run, pasta: Path, limite: dt.datetime) -> None:
+def _arquiva(job: Job, run: Run, pasta: Path, limite: dt.datetime, prog: Progresso) -> None:
     fonte: FilesSource = job.source  # type: ignore[assignment]
+    prog.etapa("medindo", fonte.path)
+
+    def andamento(arquivos: int, cru: int, total_arquivos: int, total_bytes: int) -> None:
+        _checa_prazo(limite)
+        # A primeira chamada vem do percurso de medição, com zero lido e os
+        # totais já conhecidos: é ela que troca "medindo" por "lendo".
+        if prog.stage == "medindo":
+            prog.etapa("lendo", f"{total_arquivos} arquivos", total=total_bytes)
+            return
+        prog.anda(cru, total_bytes, f"{arquivos} de {total_arquivos} arquivos")
+
     resultado = archive.create(
         archive.ArchiveRequest(
             source=Path(fonte.path),
@@ -209,7 +291,7 @@ def _arquiva(job: Job, run: Run, pasta: Path, limite: dt.datetime) -> None:
             follow_links=fonte.follow_links,
             format=fonte.archive_format.value,
         ),
-        on_progress=lambda _a, _b: _checa_prazo(limite),
+        on_progress=andamento,
     )
     run.artifact = resultado.output_file.name
     run.bytes = resultado.bytes_written
@@ -237,9 +319,16 @@ def _checa_prazo(limite: dt.datetime) -> None:
 # Envio
 # ----------------------------------------------------------------------------
 
-def _envia(job: Job, run: Run, pasta: Path, estado: State) -> None:
+def _envia(
+    job: Job, run: Run, pasta: Path, estado: State, prog: Progresso,
+    limite: dt.datetime,
+) -> None:
     destinos = DestinationStore.load()
     prefixo = f"{job.name}/{run.folder}"
+    # Num artefato grande o envio é a etapa mais demorada, e a única em que a
+    # espera não é culpa nossa. Saber que subiram 3 de 12 GB é a diferença
+    # entre esperar e reiniciar o worker achando que travou.
+    a_enviar = sum(f.stat().st_size for f in pasta.iterdir() if f.is_file())
 
     for ligacao in job.destinations:
         destino = destinos.get(ligacao.name)
@@ -252,9 +341,36 @@ def _envia(job: Job, run: Run, pasta: Path, estado: State) -> None:
             continue
 
         inicio = time.monotonic()
+        prog.etapa("enviando", f"{ligacao.name}: {destino.location()}", total=a_enviar)
+
+        def andamento(enviados_ate_agora: int) -> None:
+            # O prazo do job também vale aqui. Sem esta checagem um envio lento
+            # corria para sempre: o dump e o arquivamento olhavam o relógio, o
+            # upload não, e é ele a etapa mais longa de um artefato grande.
+            _checa_prazo(limite)
+            prog.anda(enviados_ate_agora)
+
         try:
             motor = destinations.backend(destino)
-            enviados = motor.upload(pasta, prefixo)
+            enviados = motor.upload(pasta, prefixo, on_progress=andamento)
+        except TimeoutError:
+            # Fica pendente em vez de virar falha: o artefato continua no
+            # staging e o tick reenfileira só o envio, sem refazer o backup.
+            run.stages.append(StageRecord(
+                Stage.UPLOAD, StageState.FAILED, ligacao.name,
+                f"passou do limite de {job.timeout_minutes} min enviando",
+                time.monotonic() - inicio,
+            ))
+            run.destinations_pending.append(ligacao.name)
+            run.error_stage = Stage.UPLOAD
+            run.error_cause = f"o envio não coube nos {job.timeout_minutes} min do job"
+            run.error_fix = ("aumente o timeout do job, ou deixe o reenvio automático"
+                             " terminar o que falta")
+            run.log.append((
+                dt.datetime.now().strftime("%H:%M:%S"), ligacao.name,
+                "envio interrompido pelo prazo do job",
+            ))
+            continue
         except Exception as exc:  # noqa: BLE001
             run.stages.append(StageRecord(
                 Stage.UPLOAD, StageState.FAILED, ligacao.name,

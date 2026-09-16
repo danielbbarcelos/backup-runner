@@ -10,6 +10,8 @@ que importa fica sempre nas primeiras linhas.
 """
 from __future__ import annotations
 
+import time
+
 from . import console as c
 from . import keys
 from . import forms, prompt, views
@@ -50,16 +52,22 @@ def _laco(ctx: Context) -> int:
         ctx.refresh()
         moldura(ctx)
         views.resumo(ctx)
+        opcoes = [
+            ("jobs", "jobs           listar, criar, editar, rodar"),
+            ("hist", "execuções      histórico e detalhe"),
+            ("dest", "destinos       listar, criar, testar"),
+            ("avisos", "avisos         quais eventos notificam"),
+            ("saude", "saúde          tick, worker, chave, espaço"),
+        ]
+        # Só aparece quando há o que acompanhar, e aparece em primeiro lugar:
+        # com um backup em curso, é essa a pergunta de quem abriu o programa.
+        if ctx.running_run is not None:
+            opcoes.insert(0, ("acompanhar", "acompanhar     o backup em curso, ao vivo"))
+
         try:
             escolha = prompt.escolhe(
                 "o que você quer fazer",
-                [
-                    ("jobs", "jobs           listar, criar, editar, rodar"),
-                    ("hist", "execuções      histórico e detalhe"),
-                    ("dest", "destinos       listar, criar, testar"),
-                    ("avisos", "avisos         quais eventos notificam"),
-                    ("saude", "saúde          tick, worker, chave, espaço"),
-                ],
+                opcoes,
                 permitir_cancelar=True,
                 rotulo_saida="sair",
             )
@@ -70,6 +78,7 @@ def _laco(ctx: Context) -> int:
             if escolha == "sair":
                 return 0
             {
+                "acompanhar": menu_acompanhar,
                 "jobs": menu_jobs,
                 "hist": menu_historico,
                 "dest": menu_destinos,
@@ -81,6 +90,35 @@ def _laco(ctx: Context) -> int:
 
 
 # ----------------------------------------------------------------------------
+
+def menu_acompanhar(ctx: Context) -> None:
+    """Redesenha o andamento até o backup terminar, ou até ctrl-c.
+
+    Sai sozinho quando a execução acaba, mostrando o desfecho: quem esperou
+    meia hora olhando a barra merece ver como terminou sem ter que procurar.
+    """
+    ultima = ctx.running_run
+    if ultima is None:
+        return
+    alvo = ultima.id
+    try:
+        while True:
+            ctx.refresh()
+            moldura(ctx, "acompanhar")
+            if ctx.running_run is None:
+                final = ctx.state.get_run(alvo)
+                if final is not None:
+                    views.detalhe_execucao(ctx, final)
+                print()
+                prompt.pausa("terminou. enter para voltar")
+                return
+            views.andamento(ctx)
+            print()
+            c.nota("ctrl-c para voltar ao menu, o backup continua rodando")
+            time.sleep(2.0)
+    except KeyboardInterrupt:
+        return
+
 
 def menu_jobs(ctx: Context) -> None:
     while True:

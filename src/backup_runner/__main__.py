@@ -66,6 +66,58 @@ def cmd_status(args: argparse.Namespace) -> int:
 # Jobs
 # ----------------------------------------------------------------------------
 
+def cmd_watch(args: argparse.Namespace) -> int:
+    """Redesenha o andamento até o backup acabar.
+
+    É o comando para deixar aberto num canto da tela enquanto o job grande
+    roda. Ele sai sozinho quando a execução termina, e mostra o desfecho, para
+    não exigir que alguém fique olhando para saber o que deu.
+    """
+    import time
+
+    from . import views
+
+    ctx = _ctx()
+    vistas = 0
+    ultima_id = None
+    try:
+        while True:
+            ctx.refresh()
+            run = ctx.running_run
+            c.limpa()
+            c.titulo("acompanhando", sub=f"atualiza a cada {args.intervalo:.0f}s, ctrl-c para sair")
+            print()
+            if run is not None:
+                ultima_id = run.id
+                views.andamento(ctx)
+                vistas += 1
+            elif ultima_id is not None:
+                # A execução que estávamos vendo acabou: mostra o desfecho e sai,
+                # em vez de voltar a um painel vazio que não conta o final.
+                final = ctx.state.get_run(ultima_id)
+                if final is not None:
+                    print()
+                    views.detalhe_execucao(ctx, final)
+                return 0
+            else:
+                c.vazio(
+                    "Nada rodando agora.",
+                    "ponha um job na fila com: backup-runner run <job>",
+                )
+                if ctx.queue_size:
+                    print()
+                    c.info(f"{ctx.queue_size} na fila, esperando o worker")
+                elif not args.esperar:
+                    return 0
+            if args.uma_vez:
+                return 0
+            time.sleep(args.intervalo)
+    except KeyboardInterrupt:
+        print()
+        c.info("o backup continua rodando em segundo plano")
+        return 0
+
+
 def cmd_jobs(args: argparse.Namespace) -> int:
     from . import views
 
@@ -301,7 +353,8 @@ def cmd_tick(args: argparse.Namespace) -> int:
     from .tick import run_tick
 
     resultado = run_tick()
-    if args.verbose or resultado.enfileirados or resultado.perdidos or resultado.reenvios:
+    if (args.verbose or resultado.enfileirados or resultado.perdidos
+            or resultado.reenvios or resultado.abandonadas):
         print(resultado.resumo())
         for nome, janela, atrasado in resultado.enfileirados:
             print(f"  fila     {nome}  janela {janela:%d/%m %H:%M}" + (" (atrasado)" if atrasado else ""))
@@ -309,6 +362,8 @@ def cmd_tick(args: argparse.Namespace) -> int:
             print(f"  perdida  {nome}  janela {janela:%d/%m %H:%M}")
         for nome in resultado.reenvios:
             print(f"  reenvio  {nome}")
+        for run_id, nome in resultado.abandonadas:
+            print(f"  órfã     {nome}  execução #{run_id} sem worker, marcada como falha")
     return 0
 
 
@@ -591,6 +646,14 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("status", help="resumo do sistema")
     s.add_argument("--jobs", action="store_true", help="lista os jobs junto")
     s.set_defaults(func=cmd_status)
+
+    s = sub.add_parser("watch", help="acompanha o backup em execução, ao vivo")
+    s.add_argument("--intervalo", type=float, default=2.0, help="segundos entre redesenhos")
+    s.add_argument("--esperar", action="store_true",
+                   help="fica aberto mesmo sem nada rodando, esperando começar")
+    s.add_argument("--uma-vez", dest="uma_vez", action="store_true",
+                   help="desenha uma vez e sai")
+    s.set_defaults(func=cmd_watch)
 
     s = sub.add_parser("jobs", help="lista os jobs")
     s.set_defaults(func=cmd_jobs)

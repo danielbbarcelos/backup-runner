@@ -43,7 +43,16 @@ CREATE TABLE IF NOT EXISTS runs (
     error_fix     TEXT,
     retry_at      TEXT,
     retry_count   INTEGER NOT NULL DEFAULT 0,
-    payload       TEXT    NOT NULL DEFAULT '{}'
+    payload       TEXT    NOT NULL DEFAULT '{}',
+    -- Progresso ao vivo: o worker escreve enquanto trabalha, para quem
+    -- perguntar de fora saber o que está acontecendo. Sem isto, um dump de
+    -- doze gigabytes fica quarenta minutos dizendo apenas "rodando".
+    prog_stage    TEXT,
+    prog_done     INTEGER NOT NULL DEFAULT 0,
+    prog_total    INTEGER NOT NULL DEFAULT 0,
+    prog_label    TEXT,
+    prog_pid      INTEGER,
+    heartbeat     TEXT
 );
 CREATE INDEX IF NOT EXISTS runs_job_started ON runs(job, started_at DESC);
 CREATE INDEX IF NOT EXISTS runs_started ON runs(started_at DESC);
@@ -87,6 +96,29 @@ class State:
         self.conn.execute("PRAGMA synchronous=NORMAL;")
         self.conn.execute("PRAGMA foreign_keys=ON;")
         self.conn.executescript(SCHEMA)
+        self._migra()
+
+    def _migra(self) -> None:
+        """Acrescenta colunas que versões novas passaram a usar.
+
+        Um banco criado por versão anterior não tem as colunas de progresso, e
+        `CREATE TABLE IF NOT EXISTS` não as adiciona. Sem isto, atualizar o
+        programa quebraria a leitura do histórico que já existe.
+        """
+        existentes = {
+            linha["name"] for linha in self.conn.execute("PRAGMA table_info(runs)")
+        }
+        novas = {
+            "prog_stage": "TEXT",
+            "prog_done": "INTEGER NOT NULL DEFAULT 0",
+            "prog_total": "INTEGER NOT NULL DEFAULT 0",
+            "prog_label": "TEXT",
+            "prog_pid": "INTEGER",
+            "heartbeat": "TEXT",
+        }
+        for coluna, tipo in novas.items():
+            if coluna not in existentes:
+                self.conn.execute(f"ALTER TABLE runs ADD COLUMN {coluna} {tipo}")
 
     def close(self) -> None:
         self.conn.close()
@@ -213,6 +245,42 @@ class State:
             ),
         )
 
+    def progresso(
+        self,
+        run_id: int,
+        *,
+        stage: str,
+        done: int = 0,
+        total: int = 0,
+        label: str = "",
+        pid: int | None = None,
+    ) -> None:
+        """Marca onde a execução está. Uma escrita curta, chamada com frequência.
+
+        Não toca no payload nem no resultado: é só a batida de coração mais o
+        contador, para a escrita ser barata o bastante para acontecer a cada
+        poucos segundos durante horas.
+        """
+        self.conn.execute(
+            "UPDATE runs SET prog_stage=?, prog_done=?, prog_total=?, prog_label=?,"
+            " prog_pid=COALESCE(?, prog_pid), heartbeat=? WHERE id=?",
+            (stage, done, total, label, pid, _fmt(dt.datetime.now()), run_id),
+        )
+
+    def progresso_de(self, run_id: int) -> dict | None:
+        """O progresso cru, sem montar a execução inteira."""
+        linha = self.conn.execute(
+            "SELECT prog_stage, prog_done, prog_total, prog_label, prog_pid, heartbeat,"
+            " started_at, job FROM runs WHERE id=?",
+            (run_id,),
+        ).fetchone()
+        if linha is None:
+            return None
+        dados = dict(linha)
+        dados["heartbeat"] = _parse(dados["heartbeat"])
+        dados["started_at"] = _parse(dados["started_at"])
+        return dados
+
     def get_run(self, run_id: int) -> Run | None:
         linha = self.conn.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
         return _row_to_run(linha) if linha else None
@@ -267,6 +335,33 @@ class State:
             (RunResult.RUNNING.value,),
         ).fetchone()
         return _row_to_run(linha) if linha else None
+
+    def orfas(self, limite_segundos: int = 90) -> list[Run]:
+        """Execuções marcadas como rodando que pararam de dar sinal de vida.
+
+        Uma delas é o rastro de um worker morto: o processo caiu entre o
+        `insert_run` e o `update_run` final, e a linha ficou em "rodando" para
+        sempre, escondendo o próximo backup atrás de um que já acabou.
+
+        Só o carimbo de hora decide aqui; conferir se o processo ainda existe é
+        de quem chama, porque este módulo não fala com o sistema operacional.
+        Execuções antigas, de antes das colunas de progresso, têm heartbeat
+        nulo e caem fora: sem batida nenhuma não há como distinguir um worker
+        morto de um que nunca soube reportar.
+        """
+        corte = _fmt(dt.datetime.now() - dt.timedelta(seconds=limite_segundos))
+        linhas = self.conn.execute(
+            "SELECT * FROM runs WHERE result=? AND heartbeat IS NOT NULL AND heartbeat < ?"
+            " ORDER BY id",
+            (RunResult.RUNNING.value, corte),
+        ).fetchall()
+        return [_row_to_run(linha) for linha in linhas]
+
+    def pid_de(self, run_id: int) -> int | None:
+        linha = self.conn.execute(
+            "SELECT prog_pid FROM runs WHERE id=?", (run_id,)
+        ).fetchone()
+        return linha["prog_pid"] if linha else None
 
     def pending_uploads(self) -> list[Run]:
         linhas = self.conn.execute(

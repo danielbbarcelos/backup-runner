@@ -78,6 +78,52 @@ BAR_FULL = "█"
 BAR_EMPTY = "░"
 
 
+def progress_bar(feito: int, total: int, largura: int = 24) -> str:
+    """A barra em si, sem cor e sem número: só o desenho.
+
+    Total zero significa "ainda não sei quanto é", e aí não há barra para
+    desenhar, só espaço em branco: uma barra vazia parada mentiria dizendo
+    zero por cento de um todo conhecido.
+
+    A porcentagem do dump é estimada e às vezes passa de 100 (o SQL em texto é
+    maior que o dado em disco). A barra enche e para; quem mostra o número
+    decide o que dizer.
+    """
+    if total <= 0:
+        return " " * largura
+    fracao = min(1.0, max(0.0, feito / total))
+    cheias = int(round(fracao * largura))
+    return BAR_FULL * cheias + BAR_EMPTY * (largura - cheias)
+
+
+def eta_segundos(feito: int, total: int, segundos_decorridos: float) -> float | None:
+    """Quantos segundos faltam, pela média até agora, ou None se não dá para dizer.
+
+    Deliberadamente burro: média simples, sem suavizar. Uma estimativa que
+    oscila avisa que a taxa está oscilando, o que é informação verdadeira.
+
+    Devolve número, e não texto, porque quem chama precisa comparar isto com o
+    prazo do job. Formatar cedo demais obrigaria a desformatar depois.
+    """
+    if total <= 0 or feito <= 0 or segundos_decorridos <= 0 or feito >= total:
+        return None
+    taxa = feito / segundos_decorridos
+    if taxa <= 0:
+        return None
+    return (total - feito) / taxa
+
+
+def format_eta(feito: int, total: int, segundos_decorridos: float) -> str:
+    restam = eta_segundos(feito, total, segundos_decorridos)
+    return format_relative(restam) if restam else ""
+
+
+def format_rate(bytes_feitos: int, segundos: float) -> str:
+    if segundos <= 0 or bytes_feitos <= 0:
+        return ""
+    return f"{format_bytes(int(bytes_feitos / segundos))}/s"
+
+
 def css_variables() -> dict[str, str]:
     """Variáveis expostas ao CSS do Textual, com prefixo `br-`.
 

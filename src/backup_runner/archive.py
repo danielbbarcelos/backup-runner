@@ -32,6 +32,10 @@ class ArchiveRequest:
     follow_links: bool = False
     format: str = "tar.gz"
     compress_level: int = 6
+    # Percorrer a árvore antes custa segundos e dá o denominador do progresso.
+    # Num diretório de doze gigabytes, esses segundos compram a diferença entre
+    # "12,4 GB lidos" e "12,4 de 31,0 GB, faltam ~18min".
+    medir_antes: bool = True
 
 
 @dataclass
@@ -100,12 +104,13 @@ def _percorre(base: Path, padroes: list[str], seguir_links: bool, fora: list[int
 def create(
     request: ArchiveRequest,
     *,
-    on_progress: Callable[[int, int], None] | None = None,
+    on_progress: Callable[[int, int, int, int], None] | None = None,
 ) -> ArchiveResult:
     """Compacta o diretório, escrevendo enquanto lê.
 
-    `on_progress(arquivos, bytes)` é chamado a cada 200 arquivos, o suficiente
-    para o terminal mostrar movimento sem gastar tempo com isso.
+    `on_progress(arquivos, bytes, total_arquivos, total_bytes)` é chamado a cada
+    cem arquivos. Os totais vêm de um percurso prévio, e são zero quando
+    `medir_antes` está desligado.
     """
     base = request.source.expanduser().resolve()
     if not base.is_dir():
@@ -117,11 +122,18 @@ def create(
         destino = destino.with_name(destino.name + extensao)
     destino.parent.mkdir(parents=True, exist_ok=True)
 
+    total_bytes = total_arquivos = 0
+    if request.medir_antes and on_progress is not None:
+        medida = preview(base, request.excludes, request.follow_links)
+        total_bytes, total_arquivos = medida["bytes"], medida["arquivos"]
+        on_progress(0, 0, total_arquivos, total_bytes)
+
     inicio = time.monotonic()
+    alvo = (total_arquivos, total_bytes)
     if request.format == "tar.gz":
-        arquivos, cru, fora = _tar(base, destino, request, on_progress)
+        arquivos, cru, fora = _tar(base, destino, request, on_progress, alvo)
     else:
-        arquivos, cru, fora = _zip(base, destino, request, on_progress)
+        arquivos, cru, fora = _zip(base, destino, request, on_progress, alvo)
 
     return ArchiveResult(
         output_file=destino,
@@ -133,7 +145,7 @@ def create(
     )
 
 
-def _tar(base: Path, destino: Path, request: ArchiveRequest, on_progress) -> tuple[int, int, int]:
+def _tar(base: Path, destino: Path, request: ArchiveRequest, on_progress, alvo=(0, 0)) -> tuple[int, int, int]:
     arquivos = cru = 0
     fora = [0]
     # `w|gz` é o modo de fluxo: escreve sem voltar atrás e sem montar índice.
@@ -159,12 +171,12 @@ def _tar(base: Path, destino: Path, request: ArchiveRequest, on_progress) -> tup
                 # inteiro; o que importa é levar o resto.
                 continue
             arquivos += 1
-            if on_progress and arquivos % 200 == 0:
-                on_progress(arquivos, cru)
+            if on_progress and arquivos % 100 == 0:
+                on_progress(arquivos, cru, alvo[0], alvo[1])
     return arquivos, cru, fora[0]
 
 
-def _zip(base: Path, destino: Path, request: ArchiveRequest, on_progress) -> tuple[int, int, int]:
+def _zip(base: Path, destino: Path, request: ArchiveRequest, on_progress, alvo=(0, 0)) -> tuple[int, int, int]:
     arquivos = cru = 0
     fora = [0]
     with zipfile.ZipFile(
@@ -177,8 +189,8 @@ def _zip(base: Path, destino: Path, request: ArchiveRequest, on_progress) -> tup
             except OSError:
                 continue
             arquivos += 1
-            if on_progress and arquivos % 200 == 0:
-                on_progress(arquivos, cru)
+            if on_progress and arquivos % 100 == 0:
+                on_progress(arquivos, cru, alvo[0], alvo[1])
     return arquivos, cru, fora[0]
 
 

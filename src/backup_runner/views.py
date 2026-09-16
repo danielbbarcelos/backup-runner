@@ -10,7 +10,15 @@ import datetime as dt
 
 from . import console as c
 from .context import Context, JobView
-from .format import format_bytes, format_count, format_duration, format_relative
+from .format import (
+    eta_segundos as _eta_segundos,
+    format_bytes,
+    format_count,
+    format_duration,
+    format_rate,
+    format_relative,
+    progress_bar,
+)
 from .health import Level, summary
 from .models import CHANNELS, NOTIFY_EVENTS, RunResult, SourceKind
 from .schedule import humanize
@@ -44,6 +52,95 @@ def quando(momento: dt.datetime | None) -> str:
     if momento.date() == hoje + dt.timedelta(days=1):
         return momento.strftime("amanhã %H:%M")
     return momento.strftime("%d/%m %H:%M")
+
+
+# ----------------------------------------------------------------------------
+# Andamento do que está rodando agora
+# ----------------------------------------------------------------------------
+
+# Depois disto sem o worker escrever nada, o progresso é velho demais para
+# valer. O worker grava no máximo uma vez por segundo, então noventa segundos
+# de silêncio são silêncio de verdade, não throttle.
+SEM_SINAL_SEGUNDOS = 90
+
+
+def andamento(ctx: Context) -> bool:
+    """O que o backup em curso está fazendo agora. Devolve se havia algo.
+
+    Esta tela existe porque "rodando" não é resposta quando o job tem doze
+    gigabytes: depois de meia hora, quem olha precisa saber se aquilo anda, e
+    se não anda, se ainda há alguém do outro lado.
+    """
+    from .service import pid_vivo
+
+    run = ctx.running_run
+    if run is None:
+        return False
+
+    prog = ctx.state.progresso_de(run.id) or {}
+    etapa = prog.get("prog_stage")
+    feito, total = prog.get("prog_done") or 0, prog.get("prog_total") or 0
+    rotulo, batida = prog.get("prog_label") or "", prog.get("heartbeat")
+    decorrido = (dt.datetime.now() - run.started_at).total_seconds()
+
+    c.secao(f"em execução: {run.job}")
+    if etapa:
+        c.linha("etapa", c.primary(etapa) + (f"  {c.dim(rotulo)}" if rotulo else ""))
+    else:
+        # Execução iniciada por um worker anterior ao acompanhamento. Dizer
+        # "iniciando" seria inventar: ela pode estar em qualquer etapa.
+        c.linha("etapa", c.dim("sem detalhe, o worker desta execução não reporta progresso"))
+
+    if total > 0:
+        pct = feito / total * 100
+        # Estimado pelo tamanho no disco: no dump o SQL em texto é maior, e
+        # passar de 100% é normal. Dizer ">99%" é honesto; dizer 100% não.
+        texto = f"{min(pct, 99.9):.1f}%" if pct < 100 else ">99%"
+        c.linha("progresso", f"{c.primary(progress_bar(feito, total))} {texto}"
+                             f"  {format_bytes(feito)} de {format_bytes(total)}")
+    elif feito > 0:
+        c.linha("progresso", f"{format_bytes(feito)}, total ainda desconhecido")
+
+    ritmo = format_rate(feito, decorrido)
+    eta = _eta_segundos(feito, total, decorrido)
+    c.linha("tempo", f"{format_duration(decorrido)} até aqui"
+            + (f", {ritmo}" if ritmo else "")
+            + (f", faltam ~{format_relative(eta)}" if eta else ""))
+
+    # O prazo do job é um limite real: ao estourar, a execução é interrompida
+    # e o que já subiu vira reenvio pendente. Numa transferência de horas, ver
+    # que sobram vinte minutos de prazo para uma hora de envio é o aviso que
+    # permite aumentar o timeout antes de perder o trabalho, não depois.
+    vista = ctx.view(run.job)
+    if vista is not None:
+        minutos = vista.job.timeout_minutes
+        sobra = (run.started_at + dt.timedelta(minutes=minutos)
+                 - dt.datetime.now()).total_seconds()
+        texto = f"limite de {minutos} min, {format_relative(max(sobra, 0))} restantes"
+        if sobra <= 0:
+            c.linha("prazo", c.danger(f"{c.SYM_FAIL} passou do limite de {minutos} min"))
+        elif eta and eta > sobra:
+            c.linha("prazo", c.danger(
+                f"{c.SYM_FAIL} {texto}, mas neste ritmo faltam {format_relative(eta)}"))
+        elif sobra < 900:
+            c.linha("prazo", c.warn(f"{c.SYM_WARN} {texto}"))
+        else:
+            c.linha("prazo", c.muted(texto))
+
+    atraso = (dt.datetime.now() - batida).total_seconds() if batida else None
+    pid = prog.get("prog_pid")
+    if atraso is not None and atraso > SEM_SINAL_SEGUNDOS and not pid_vivo(pid):
+        c.linha("sinal", c.danger(
+            f"{c.SYM_FAIL} sem sinal há {format_relative(atraso)} e o processo {pid} sumiu"))
+        print()
+        c.aviso("esta execução morreu sem terminar. o tick a marca como falha "
+                "no próximo minuto, ou force agora com: backup-runner tick")
+    elif atraso is not None and atraso > SEM_SINAL_SEGUNDOS:
+        c.linha("sinal", c.warn(
+            f"{c.SYM_WARN} vivo (pid {pid}), mas sem progresso há {format_relative(atraso)}"))
+    elif atraso is not None:
+        c.linha("sinal", c.ok(f"{c.SYM_OK} há {format_relative(atraso)}"))
+    return True
 
 
 # ----------------------------------------------------------------------------
@@ -81,6 +178,10 @@ def resumo(ctx: Context) -> None:
             f"{badge(ultima.result)}  {ultima.job}, {format_bytes(ultima.bytes)}"
             f" em {format_duration(ultima.duration)}",
         )
+
+    if ctx.running_run is not None:
+        print()
+        andamento(ctx)
 
     atrasados = ctx.stale_jobs()
     if atrasados:

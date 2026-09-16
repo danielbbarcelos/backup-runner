@@ -279,3 +279,24 @@ def status() -> Estado:
             conserto=f"{APP_SLUG} install",
         )
     return pelo_supervisor or Estado(mensagem="o worker não está instalado")
+
+
+def pid_vivo(pid: int | None) -> bool:
+    """Existe um processo com este pid?
+
+    `os.kill(pid, 0)` não mata nada: pergunta ao núcleo se dá para sinalizar.
+    Permissão negada também é resposta afirmativa, o processo existe e é de
+    outro dono. É assim que se distingue um backup demorado de um worker que
+    morreu no meio e deixou a linha "rodando" para sempre.
+    """
+    if not pid or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True

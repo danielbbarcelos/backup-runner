@@ -15,10 +15,10 @@ uma cópia de segunda, não o dado de sábado.
 from __future__ import annotations
 
 import datetime as dt
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from .config import JobStore, Settings
-from .models import Job, Run, RunResult
+from .models import Job, Run, RunResult, Stage
 from .schedule import Cron, CronError
 from .state import State
 
@@ -29,6 +29,7 @@ class TickResult:
     perdidos: list[tuple[str, dt.datetime]]
     reenvios: list[str]
     pulados: list[str]
+    abandonadas: list[tuple[int, str]] = field(default_factory=list)
 
     def resumo(self) -> str:
         partes = []
@@ -38,6 +39,8 @@ class TickResult:
             partes.append(f"{len(self.perdidos)} janelas perdidas")
         if self.reenvios:
             partes.append(f"{len(self.reenvios)} reenvios")
+        if self.abandonadas:
+            partes.append(f"{len(self.abandonadas)} abandonadas")
         return ", ".join(partes) or "nada a fazer"
 
 
@@ -49,6 +52,7 @@ def run_tick(agora: dt.datetime | None = None, *, state: State | None = None) ->
     resultado = TickResult([], [], [], [])
 
     try:
+        _fecha_orfas(estado, resultado)
         for job in jobs.list():
             if not job.enabled:
                 resultado.pulados.append(job.name)
@@ -59,6 +63,37 @@ def run_tick(agora: dt.datetime | None = None, *, state: State | None = None) ->
         if state is None:
             estado.close()
     return resultado
+
+
+def _fecha_orfas(estado: State, resultado: TickResult) -> None:
+    """Encerra execuções cujo worker morreu sem escrever o desfecho.
+
+    Roda antes de enfileirar qualquer coisa, e é por isso que existe: enquanto
+    a linha antiga diz "rodando", o job parece ocupado e o backup de hoje não
+    entra na fila. Um worker morto em janeiro adiaria todo backup até alguém
+    notar.
+
+    O critério tem duas pernas, e as duas precisam ceder: silêncio longo no
+    heartbeat e nenhum processo com aquele pid. Só o silêncio não basta, porque
+    uma máquina suspensa deixa qualquer worker mudo sem que ele tenha morrido.
+    """
+    from .service import pid_vivo
+
+    for run in estado.orfas():
+        pid = estado.pid_de(run.id)
+        if pid_vivo(pid):
+            continue
+        run.result = RunResult.FAILED
+        run.finished_at = dt.datetime.now()
+        run.error_stage = run.error_stage or Stage.DUMP
+        run.error_cause = f"o worker (pid {pid or '?'}) morreu no meio da execução"
+        run.error_fix = "veja os logs do worker e rode de novo: backup-runner run " + run.job
+        run.log.append((
+            run.finished_at.strftime("%H:%M:%S"), "tick",
+            "execução sem sinal de vida, marcada como falha",
+        ))
+        estado.update_run(run)
+        resultado.abandonadas.append((run.id, run.job))
 
 
 def _avaliar(job: Job, agora: dt.datetime, estado: State, resultado: TickResult) -> None:
