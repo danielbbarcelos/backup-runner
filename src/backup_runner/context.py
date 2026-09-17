@@ -75,6 +75,47 @@ class JobView:
         return (agora - self.last_success.started_at) > limite
 
 
+def encerra_job(ctx: "Context", nome: str) -> dict:
+    """Apaga o job e tudo que era dele, devolvendo o que foi encerrado.
+
+    Apagar um job é dizer "não quero mais nada disto". Até aqui o programa
+    entendia pela metade: tirava o cadastro e os registros, mas deixava o que
+    estava na fila, o artefato meio pronto no staging, e principalmente a
+    execução em curso, que seguia até o fim e ainda mandava email e Slack
+    sobre um job que já não existia.
+
+    A execução em curso não morre aqui: quem a interrompe é o worker, que
+    percebe a ausência do job em até dois segundos e desiste sem avisar
+    ninguém. Esta função só precisa dizer que existia uma.
+    """
+    import shutil
+
+    from .config import staging_dir
+
+    rodando = ctx.state.running()
+    # A fila primeiro, e só depois os registros: `delete_job_runs` limpa a fila
+    # inteira de quebra, então contar depois dele daria sempre zero.
+    parado = {
+        "fila": ctx.state.cancel_queue(nome),
+        "execucoes": ctx.state.delete_job_runs(nome),
+        "rodando": rodando is not None and rodando.job == nome,
+        "staging": 0,
+    }
+
+    pasta = staging_dir() / nome
+    if pasta.is_dir():
+        parado["staging"] = sum(
+            f.stat().st_size for f in pasta.rglob("*") if f.is_file()
+        )
+        shutil.rmtree(pasta, ignore_errors=True)
+
+    # O cadastro sai por último: enquanto ele existir, o worker em curso ainda
+    # se considera legítimo, e é a ausência dele que serve de sinal de parada.
+    ctx.jobs.delete(nome)
+    ctx.refresh()
+    return parado
+
+
 @dataclass
 class Context:
     jobs: JobStore = field(default_factory=JobStore.load)

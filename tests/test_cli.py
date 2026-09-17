@@ -813,14 +813,39 @@ def test_saida_do_menu_deixa_o_cursor_na_coluna_zero():
     if pid == 0:
         os.execv(sys.executable, [sys.executable, "-c", codigo])
 
-    time.sleep(1.2)
-    for _ in range(6):          # desce até "sair"
+    def le(deadline: float) -> bytes:
+        """Lê o que o pty tiver até o prazo, sem travar quando não vem nada."""
+        visto = b""
+        while time.time() < deadline:
+            if not select.select([fd], [], [], 0.1)[0]:
+                continue
+            try:
+                pedaco = os.read(fd, 4096)
+            except OSError:
+                break
+            if not pedaco:
+                break
+            visto += pedaco
+        return visto
+
+    # Esperar a tela aparecer, em vez de dormir um tanto arbitrário: sob carga,
+    # um sleep fixo mandava as setas antes de existir menu para navegar.
+    inicial = b""
+    limite = time.time() + 10
+    while time.time() < limite and b"navega" not in inicial:
+        inicial += le(time.time() + 0.3)
+    assert b"navega" in inicial, "o menu não chegou a desenhar"
+
+    # Mais descidas do que itens: como a navegação não dá a volta, o cursor para
+    # no último, que é "sair". Contar teclas exatas quebrava sempre que o menu
+    # ganhava um item condicional, como o "acompanhar" de quando há algo rodando.
+    for _ in range(12):
         os.write(fd, b"\x1b[B")
-        time.sleep(0.1)
+        time.sleep(0.02)
     os.write(fd, b"\r")
 
-    saida = b""
-    fim = time.time() + 3
+    saida = inicial
+    fim = time.time() + 10
     while time.time() < fim:
         if not select.select([fd], [], [], 0.2)[0]:
             continue

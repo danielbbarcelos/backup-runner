@@ -370,6 +370,20 @@ class State:
         ).fetchall()
         return [_row_to_run(l) for l in linhas]
 
+    def delete_run(self, run_id: int) -> None:
+        self.conn.execute("DELETE FROM runs WHERE id=?", (run_id,))
+
+    def cancel_queue(self, job: str) -> int:
+        """Tira da fila o que ainda não começou, e diz quantos eram.
+
+        O que já está rodando não sai por aqui: quem para aquilo é o worker,
+        ao perceber que o job sumiu.
+        """
+        cur = self.conn.execute(
+            "DELETE FROM queue WHERE job=? AND status='pending'", (job,)
+        )
+        return cur.rowcount
+
     def delete_job_runs(self, job: str) -> int:
         cur = self.conn.execute("DELETE FROM runs WHERE job=?", (job,))
         self.conn.execute("DELETE FROM queue WHERE job=?", (job,))

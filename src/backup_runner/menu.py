@@ -18,6 +18,7 @@ from . import forms, prompt, views
 from . import __version__
 from .context import Context
 from .models import RunResult
+from .views import _plural
 
 
 def moldura(ctx: Context, *trilha: str) -> None:
@@ -185,15 +186,26 @@ def _apaga_job(ctx: Context, view) -> None:
     destinos = ctx.job_destinations(view.job)
     c.aviso(f"apagar {view.name} remove também:")
     c.item("•", f"{execucoes} registros de execução")
+    if view.running:
+        c.item("•", "a execução que está acontecendo agora, interrompida no meio")
+    if view.queued:
+        c.item("•", "o que está esperando na fila")
     for jd, destino in destinos:
         c.item("•", f"os artefatos em {jd.name}, conforme a retenção de {jd.days(destino)} dias")
     if not prompt.confirma_digitando("isto não tem volta", view.name):
         c.info("cancelado")
         return
-    ctx.state.delete_job_runs(view.name)
-    ctx.jobs.delete(view.name)
-    ctx.refresh()
+    from .context import encerra_job
+    from .format import format_bytes
+
+    parado = encerra_job(ctx, view.name)
     c.sucesso(f"{view.name} apagado")
+    if parado["rodando"]:
+        c.info("havia uma execução em curso; o worker a interrompe em segundos")
+    if parado["fila"]:
+        c.info(f"{parado['fila']} {_plural(parado['fila'], 'item')} tirados da fila")
+    if parado["staging"]:
+        c.info(f"{format_bytes(parado['staging'])} liberados do staging")
 
 
 def _escolhe_job(ctx: Context):

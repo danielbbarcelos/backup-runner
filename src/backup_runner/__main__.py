@@ -125,6 +125,10 @@ def cmd_jobs(args: argparse.Namespace) -> int:
     return 0
 
 
+def _plural(n: int, palavra: str) -> str:
+    return palavra if n == 1 else palavra + "s"
+
+
 def cmd_job(args: argparse.Namespace) -> int:
     from . import forms, views
 
@@ -157,9 +161,17 @@ def cmd_job(args: argparse.Namespace) -> int:
         ):
             c.info("cancelado")
             return 1
-        ctx.state.delete_job_runs(alvo)
-        ctx.jobs.delete(alvo)
+        from .context import encerra_job
+        from .format import format_bytes
+
+        parado = encerra_job(ctx, alvo)
         c.sucesso(f"{alvo} apagado")
+        if parado["rodando"]:
+            c.info("havia uma execução em curso; o worker a interrompe em segundos")
+        if parado["fila"]:
+            c.info(f"{parado['fila']} {_plural(parado['fila'], 'item')} tirados da fila")
+        if parado["staging"]:
+            c.info(f"{format_bytes(parado['staging'])} liberados do staging")
         return 0
 
     views.detalhe_job(ctx, view)

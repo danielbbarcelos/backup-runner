@@ -44,6 +44,15 @@ class Cancelado(Exception):
     """Sinal recebido: termina o que está fazendo e sai."""
 
 
+class JobRemovido(Exception):
+    """O job foi apagado enquanto a execução dele acontecia.
+
+    Não é falha: é ordem. Quem apaga um job está dizendo que não quer mais
+    nada dele, e continuar o dump até o fim para então avisar por email e
+    Slack sobre um job que não existe mais é o contrário do que foi pedido.
+    """
+
+
 @dataclass
 class Resultado:
     run: Run
@@ -173,15 +182,18 @@ def executa(job: Job, estado: State, *, atrasado: bool = False) -> Resultado:
     limite = inicio + dt.timedelta(minutes=job.timeout_minutes)
     prog = Progresso(estado, run.id)
     prog.etapa("preparando", job.name)
+    sentinela = Sentinela(limite, job.name)
 
     try:
-        _produz(job, run, pasta, limite, prog)
+        _produz(job, run, pasta, limite, prog, sentinela)
         _escreve_manifest(run, pasta)
-        _envia(job, run, pasta, estado, prog, limite)
+        _envia(job, run, pasta, estado, prog, sentinela)
     except mysql.MySQLError as exc:
         return _falha(run, estado, Stage.DUMP, exc, job)
     except archive.ArchiveError as exc:
         return _falha(run, estado, Stage.ARCHIVE, exc, job)
+    except JobRemovido:
+        return _desiste(run, estado, pasta)
     except TimeoutError as exc:
         return _falha(run, estado, run.error_stage or Stage.DUMP, exc, job, limpa=pasta)
     except Exception as exc:  # noqa: BLE001 - o worker não pode morrer por um job
@@ -205,15 +217,17 @@ def executa(job: Job, estado: State, *, atrasado: bool = False) -> Resultado:
     return Resultado(run, run.result in (RunResult.OK, RunResult.LATE))
 
 
-def _produz(job: Job, run: Run, pasta: Path, limite: dt.datetime, prog: Progresso) -> None:
+def _produz(job: Job, run: Run, pasta: Path, limite: dt.datetime, prog: Progresso,
+            sentinela: "Sentinela") -> None:
     """Gera o artefato no staging, comprimindo em fluxo."""
     if job.kind is SourceKind.MYSQL:
-        _dump(job, run, pasta, limite, prog)
+        _dump(job, run, pasta, limite, prog, sentinela)
     else:
-        _arquiva(job, run, pasta, limite, prog)
+        _arquiva(job, run, pasta, limite, prog, sentinela)
 
 
-def _dump(job: Job, run: Run, pasta: Path, limite: dt.datetime, prog: Progresso) -> None:
+def _dump(job: Job, run: Run, pasta: Path, limite: dt.datetime, prog: Progresso,
+          sentinela: "Sentinela") -> None:
     fonte: MySQLSource = job.source  # type: ignore[assignment]
     conexao = mysql.Connection(
         host=fonte.host, port=fonte.port, user=fonte.user,
@@ -247,7 +261,7 @@ def _dump(job: Job, run: Run, pasta: Path, limite: dt.datetime, prog: Progresso)
             log_file=pasta / "dump.log",
             compress=True,
         ),
-        on_progress=lambda cru, _gravado: (_checa_prazo(limite), prog.anda(cru)),
+        on_progress=lambda cru, _gravado: (sentinela(), prog.anda(cru)),
         on_phase=lambda fase: prog.etapa(
             "dump" if fase == "dump" else "estrutura",
             f"{len(tabelas) - len(ignoradas)} tabelas" if fase == "dump"
@@ -270,12 +284,13 @@ def _dump(job: Job, run: Run, pasta: Path, limite: dt.datetime, prog: Progresso)
     ))
 
 
-def _arquiva(job: Job, run: Run, pasta: Path, limite: dt.datetime, prog: Progresso) -> None:
+def _arquiva(job: Job, run: Run, pasta: Path, limite: dt.datetime, prog: Progresso,
+             sentinela: "Sentinela") -> None:
     fonte: FilesSource = job.source  # type: ignore[assignment]
     prog.etapa("medindo", fonte.path)
 
     def andamento(arquivos: int, cru: int, total_arquivos: int, total_bytes: int) -> None:
-        _checa_prazo(limite)
+        sentinela()
         # A primeira chamada vem do percurso de medição, com zero lido e os
         # totais já conhecidos: é ela que troca "medindo" por "lendo".
         if prog.stage == "medindo":
@@ -315,13 +330,41 @@ def _checa_prazo(limite: dt.datetime) -> None:
         raise TimeoutError("o job passou do tempo limite")
 
 
+# Ler o arquivo de jobs a cada bloco lido seria desperdício; de dois em dois
+# segundos, o worker desiste no máximo dois segundos depois do pedido.
+INTERVALO_SENTINELA = 2.0
+
+
+class Sentinela:
+    """Vigia, durante a execução, as duas razões para parar antes da hora.
+
+    O prazo do job é uma delas. A outra é o job ter sido apagado no meio do
+    caminho: o worker guarda o `Job` em memória desde o começo, então sem
+    perguntar de novo ele terminaria feliz um backup que ninguém mais quer, e
+    ainda mandaria o aviso.
+    """
+
+    def __init__(self, limite: dt.datetime, job: str) -> None:
+        self.limite, self.job = limite, job
+        self._ultima = 0.0
+
+    def __call__(self) -> None:
+        _checa_prazo(self.limite)
+        agora = time.monotonic()
+        if agora - self._ultima < INTERVALO_SENTINELA:
+            return
+        self._ultima = agora
+        if JobStore.load().get(self.job) is None:
+            raise JobRemovido(self.job)
+
+
 # ----------------------------------------------------------------------------
 # Envio
 # ----------------------------------------------------------------------------
 
 def _envia(
     job: Job, run: Run, pasta: Path, estado: State, prog: Progresso,
-    limite: dt.datetime,
+    sentinela: "Sentinela",
 ) -> None:
     destinos = DestinationStore.load()
     prefixo = f"{job.name}/{run.folder}"
@@ -347,7 +390,7 @@ def _envia(
             # O prazo do job também vale aqui. Sem esta checagem um envio lento
             # corria para sempre: o dump e o arquivamento olhavam o relógio, o
             # upload não, e é ele a etapa mais longa de um artefato grande.
-            _checa_prazo(limite)
+            sentinela()
             prog.anda(enviados_ate_agora)
 
         try:
@@ -410,6 +453,14 @@ def reenvia_pendentes(job: Job, estado: State) -> Resultado:
     Não refaz o dump: o arquivo já existe, e refazer custaria uma leitura nova
     do banco de produção por um problema que é de rede.
     """
+    if JobStore.load().get(job.name) is None:
+        # O tick enfileirou o reenvio, o job sumiu antes de ele ser atendido.
+        return Resultado(
+            Run(id=0, job=job.name, started_at=dt.datetime.now(),
+                finished_at=dt.datetime.now(), result=RunResult.OK),
+            True, "job apagado, reenvio descartado",
+        )
+
     pendentes = [r for r in estado.pending_uploads() if r.job == job.name]
     if not pendentes:
         run = Run(id=0, job=job.name, started_at=dt.datetime.now(),
@@ -549,6 +600,26 @@ def _falha(run: Run, estado: State, estagio: Stage, exc: Exception, job: Job, *,
     estado.update_run(run)
     _avisa(job, run)
     return Resultado(run, False, run.error_got)
+
+
+def _desiste(run: Run, estado: State, pasta: Path) -> Resultado:
+    """O job foi apagado no meio: apaga o rastro e cala a boca.
+
+    Nada de registro de falha, nada de aviso. Quem apagou o job já sabe o que
+    aconteceu com ele, e receber um email dizendo que o backup de um job
+    inexistente foi interrompido é ruído pelo qual ninguém pediu.
+
+    O artefato pela metade vai junto: ele só existia para este job.
+    """
+    shutil.rmtree(pasta, ignore_errors=True)
+    raiz = pasta.parent
+    try:
+        if raiz.is_dir() and not any(raiz.iterdir()):
+            raiz.rmdir()
+    except OSError:
+        pass
+    estado.delete_run(run.id)
+    return Resultado(run, True, f"{run.job} foi apagado durante a execução")
 
 
 def _avisa(job: Job, run: Run, *, recuperado: bool = False) -> None:
