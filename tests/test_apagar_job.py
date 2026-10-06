@@ -116,33 +116,30 @@ def test_apagar_nao_mexe_na_fila_dos_outros(tmp_path):
 # ----------------------------------------------------------------------------
 
 def test_worker_para_e_cala_quando_o_job_some_no_meio(tmp_path, monkeypatch):
-    """O sintoma relatado: backup seguia até o fim e avisava assim mesmo."""
+    """O sintoma relatado: backup seguia até o fim e avisava assim mesmo.
+
+    Quem percebe a ausência do job é a `Vigilancia`, na thread dela, e quem
+    levanta a exceção é a `Sentinela`, no callback de progresso. O intervalo do
+    vigia é encurtado aqui para o teste não depender dos cinco segundos de
+    produção.
+    """
+    import threading
+
     from backup_runner import worker
 
     job = cria_job(tmp_path)
-    # Muitos arquivos para o arquivamento durar o suficiente para a sentinela
-    # rodar pelo menos uma vez.
+    # Arquivos suficientes para o arquivamento durar mais que alguns ciclos do
+    # vigia, senão a execução termina antes de haver o que perceber.
     origem = Path(job.source.path)
-    for i in range(20, 3000):
+    for i in range(20, 4000):
         (origem / f"{i}.txt").write_text("x" * 500)
 
     avisos = []
     monkeypatch.setattr(worker, "_avisa", lambda *a, **k: avisos.append(a))
+    monkeypatch.setattr(worker, "INTERVALO_VIGILANCIA", 0.02)
 
-    # Sem espera nenhuma, a sentinela consulta o disco em toda chamada.
-    monkeypatch.setattr(worker, "INTERVALO_SENTINELA", 0.0)
-
-    # Apaga o job assim que o arquivamento começar de verdade.
-    original = worker.Sentinela.__call__
-    estado_chamadas = {"n": 0}
-
-    def espiao(self):
-        estado_chamadas["n"] += 1
-        if estado_chamadas["n"] == 2:
-            JobStore.load().delete("alvo")
-        return original(self)
-
-    monkeypatch.setattr(worker.Sentinela, "__call__", espiao)
+    # Apaga o job pouco depois do começo, de fora, como uma pessoa faria.
+    threading.Timer(0.2, lambda: JobStore.load().delete("alvo")).start()
 
     estado = State()
     estado.enqueue("alvo", dt.datetime.now())

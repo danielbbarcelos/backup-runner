@@ -36,6 +36,7 @@ class TickResult:
     abandonadas: list[tuple[int, str]] = field(default_factory=list)
     filas_soltas: list[tuple[int, str]] = field(default_factory=list)
     desistencias: list[tuple[int, str]] = field(default_factory=list)
+    staging_limpo: list[str] = field(default_factory=list)
 
     def resumo(self) -> str:
         partes = []
@@ -51,6 +52,8 @@ class TickResult:
             partes.append(f"{len(self.filas_soltas)} filas presas soltas")
         if self.desistencias:
             partes.append(f"{len(self.desistencias)} pendentes encerradas")
+        if self.staging_limpo:
+            partes.append(f"{len(self.staging_limpo)} staging limpos")
         return ", ".join(partes) or "nada a fazer"
 
 
@@ -66,6 +69,7 @@ def run_tick(agora: dt.datetime | None = None, *, state: State | None = None) ->
         # a linha fantasma ainda faz `ja_na_fila` descartar a janela deste tick.
         _solta_filas_presas(estado, resultado)
         _fecha_orfas(estado, resultado)
+        _varre_staging(estado, settings, agora, resultado)
         for job in jobs.list():
             if not job.enabled:
                 resultado.pulados.append(job.name)
@@ -76,6 +80,56 @@ def run_tick(agora: dt.datetime | None = None, *, state: State | None = None) ->
         if state is None:
             estado.close()
     return resultado
+
+
+def _varre_staging(
+    estado: State, settings: Settings, agora: dt.datetime, resultado: TickResult,
+) -> None:
+    """Remove artefato de staging que não serve mais a ninguém.
+
+    O staging é passagem. Até aqui ele só era limpo quando a execução dava
+    certo, então toda execução que falhava deixava o artefato no disco para
+    sempre, e a doze gigabytes por vez isso enche disco calado. O vigia que
+    encerra o processo à força também passa por aqui, porque ele deixa o
+    staging de propósito em vez de decidir sozinho que o artefato é lixo.
+
+    A idade vem do nome da pasta, como no resto do programa, e não do mtime:
+    mexer no arquivo não rejuvenesce o backup.
+
+    Nunca toca em execução viva nem em envio pendente. Essa é a parte que
+    importa para não causar problema em cascata: apagar o artefato de um
+    reenvio em andamento transformaria uma falha de rede em perda de backup.
+    """
+    import shutil
+
+    from .config import staging_dir
+    from .models import RunResult as RR
+
+    raiz = staging_dir()
+    if not raiz.is_dir():
+        return
+
+    intocaveis = {RR.RUNNING, RR.PENDING_UPLOAD}
+    corte = dt.timedelta(hours=settings.staging_hold_hours)
+
+    for pasta_job in sorted(p for p in raiz.iterdir() if p.is_dir()):
+        for pasta in sorted(p for p in pasta_job.iterdir() if p.is_dir()):
+            try:
+                quando = dt.datetime.strptime(pasta.name, "%Y-%m-%d_%H-%M-%S")
+            except ValueError:
+                continue          # pasta que não é de execução, não é nossa
+            if agora - quando <= corte:
+                continue
+            run = estado.run_da_pasta(pasta_job.name, pasta.name)
+            if run is not None and run.result in intocaveis:
+                continue
+            shutil.rmtree(pasta, ignore_errors=True)
+            resultado.staging_limpo.append(f"{pasta_job.name}/{pasta.name}")
+        try:
+            if pasta_job.is_dir() and not any(pasta_job.iterdir()):
+                pasta_job.rmdir()
+        except OSError:
+            pass
 
 
 def _solta_filas_presas(estado: State, resultado: TickResult) -> None:

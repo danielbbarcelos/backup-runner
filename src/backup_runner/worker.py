@@ -18,6 +18,8 @@ import json
 import os
 import shutil
 import signal
+import sys
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -164,14 +166,16 @@ def executa_item(item: dict, estado: State) -> Resultado:
 
     if item.get("kind") == "upload_retry":
         return reenvia_pendentes(job, estado)
-    return executa(job, estado, atrasado=bool(item.get("late")))
+    return executa(job, estado, atrasado=bool(item.get("late")),
+                   queue_id=item.get("id"))
 
 
 # ----------------------------------------------------------------------------
 # Execução completa
 # ----------------------------------------------------------------------------
 
-def executa(job: Job, estado: State, *, atrasado: bool = False) -> Resultado:
+def executa(job: Job, estado: State, *, atrasado: bool = False,
+            queue_id: int | None = None) -> Resultado:
     inicio = dt.datetime.now()
     run = Run(id=0, job=job.name, started_at=inicio, result=RunResult.RUNNING)
     run.log.append((inicio.strftime("%H:%M:%S"), "worker", f"execução de {job.name} iniciada"))
@@ -182,12 +186,28 @@ def executa(job: Job, estado: State, *, atrasado: bool = False) -> Resultado:
     limite = inicio + dt.timedelta(minutes=job.timeout_minutes)
     prog = Progresso(estado, run.id)
     prog.etapa("preparando", job.name)
-    sentinela = Sentinela(limite, job.name)
 
+    # Tudo daqui para baixo acontece sob o vigia, que bate o coração e cobra o
+    # prazo numa thread própria. O `with` garante que ele morre junto, inclusive
+    # quando a execução sai por exceção.
+    with Vigilancia(estado, run, job.name, limite, queue_id) as vigia:
+        return _executa_vigiado(
+            job, run, estado, pasta, limite, prog, Sentinela(vigia),
+            inicio=inicio, atrasado=atrasado,
+        )
+
+
+def _executa_vigiado(
+    job: Job, run: Run, estado: State, pasta: Path, limite: dt.datetime,
+    prog: Progresso, sentinela: Sentinela, *,
+    inicio: dt.datetime, atrasado: bool,
+) -> Resultado:
     try:
         _produz(job, run, pasta, limite, prog, sentinela)
-        _escreve_manifest(run, pasta)
+        _escreve_manifest(run, pasta, sentinela)
         _envia(job, run, pasta, estado, prog, sentinela)
+    except Cancelado as exc:
+        return _cancela(run, estado, pasta, str(exc))
     except mysql.MySQLError as exc:
         return _falha(run, estado, Stage.DUMP, exc, job)
     except archive.ArchiveError as exc:
@@ -330,32 +350,212 @@ def _checa_prazo(limite: dt.datetime) -> None:
         raise TimeoutError("o job passou do tempo limite")
 
 
-# Ler o arquivo de jobs a cada bloco lido seria desperdício; de dois em dois
-# segundos, o worker desiste no máximo dois segundos depois do pedido.
-INTERVALO_SENTINELA = 2.0
+# De quanto em quanto o vigia acorda para bater o coração e reavaliar.
+INTERVALO_VIGILANCIA = 5.0
+
+# Quanto o vigia espera a thread principal reagir antes de encerrar na marra.
+# Só é alcançado quando a principal está bloqueada dentro de uma chamada que
+# não devolve controle, que é exatamente o caso que a cooperação não resolve.
+GRACA_VIGILANCIA = 60.0
+
+
+class Vigilancia(threading.Thread):
+    """Bate o coração e cobra o prazo numa thread só sua.
+
+    Esta classe existe por causa de um defeito de desenho que custou um backup
+    de doze gigabytes. O worker informava que estava vivo, verificava o próprio
+    prazo e contava o progresso pelo mesmo canal: o callback de progresso da
+    biblioteca que fazia a entrada e saída. Quando a biblioteca bloqueou dentro
+    de uma única chamada (o `CompleteMultipartUpload`, onze threads em
+    `futex_wait` e uma em `do_poll`), as três coisas pararam juntas. "Empacado"
+    e "morto" ficaram indistinguíveis, e o prazo de quatro horas deixou de ser
+    cobrado justamente quando era necessário.
+
+    Separando os sinais, cada um passa a dizer uma coisa só:
+
+    - batida de coração: o processo existe e o laço está girando
+    - progresso: a entrada e saída está rendendo
+    - prazo: alguém cobra, com ou sem progresso
+
+    E "batida fresca sem progresso" deixa de ser ambiguidade e passa a ser um
+    estado legível: empacado numa chamada, não morto.
+
+    A cobrança é em dois tempos. Primeiro o vigia publica o motivo, a
+    `Sentinela` o lê no próximo callback e levanta a exceção, e aí a saída é
+    limpa: staging removido, desfecho gravado, fila encerrada. Se a principal
+    não reagir dentro da graça, porque está bloqueada e não vai voltar, o vigia
+    grava o desfecho **antes** de encerrar o processo à força. Essa ordem não é
+    detalhe: encerrar sem gravar recriaria a execução órfã e a linha de fila
+    presa, trocando um travamento por outro.
+    """
+
+    def __init__(
+        self,
+        estado: State,
+        run: Run,
+        job: str,
+        limite: dt.datetime,
+        queue_id: int | None = None,
+        *,
+        intervalo: float | None = None,
+        graca: float | None = None,
+    ) -> None:
+        super().__init__(name="vigilancia", daemon=True)
+        # A conexão do chamador não serve: o sqlite3 recusa conexão usada fora
+        # da thread que a criou, então o vigia abre a própria dentro do `run`.
+        # O WAL já existe justamente para dois escritores conviverem.
+        self.estado: State | None = None
+        self.execucao, self.job = run, job
+        self.limite, self.queue_id = limite, queue_id
+        # Lidos aqui e não como valor padrão de argumento: valor padrão é
+        # avaliado na definição da função, então ajustar a constante do módulo
+        # depois (em teste, por exemplo) não surtiria efeito nenhum.
+        self.intervalo = INTERVALO_VIGILANCIA if intervalo is None else intervalo
+        self.graca = GRACA_VIGILANCIA if graca is None else graca
+        self.motivo: tuple[str, str] | None = None   # (tipo, texto)
+        self.falhas = 0
+        self._desde = 0.0
+        self._parar = threading.Event()
+
+    # -- ciclo de vida ------------------------------------------------
+
+    def parar(self) -> None:
+        self._parar.set()
+
+    def __enter__(self) -> "Vigilancia":
+        self.start()
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self.parar()
+        self.join(timeout=self.intervalo + 1)
+
+    def run(self) -> None:
+        # Nome exigido pela Thread. É por isso que a execução vigiada mora em
+        # `self.execucao`: chamar o atributo de `run` sobrescreveria este
+        # método, e a thread morreria na largada tentando chamar o dataclass.
+        self.estado = State()
+        try:
+            while not self._parar.is_set():
+                try:
+                    self._ciclo()
+                    self.falhas = 0
+                except Exception as exc:  # noqa: BLE001
+                    # Vigia que morre não pode derrubar o backup. Mas vigia
+                    # mudo é pior que vigia nenhum, porque dá a impressão de
+                    # que alguém está olhando. Então ele insiste e reclama.
+                    self.falhas += 1
+                    if self.falhas in (1, 10, 100):
+                        print(
+                            f"[vigia] falha {self.falhas} ao vigiar a execução"
+                            f" {self.execucao.id}: {type(exc).__name__}: {exc}",
+                            file=sys.stderr, flush=True,
+                        )
+                self._parar.wait(self.intervalo)
+        finally:
+            if self.estado is not None:
+                self.estado.close()
+
+    # -- o que ele faz a cada volta -----------------------------------
+
+    def _ciclo(self) -> None:
+        assert self.estado is not None
+        self.estado.bate_coracao(self.execucao.id)
+        motivo = self._por_que_parar()
+        if motivo is None:
+            self.motivo, self._desde = None, 0.0
+            return
+        if self.motivo is None:
+            # Primeira vez: publica e deixa a thread principal reagir sozinha.
+            self.motivo, self._desde = motivo, time.monotonic()
+            return
+        if time.monotonic() - self._desde > self.graca:
+            self._encerra_na_marra(motivo)
+
+    def _por_que_parar(self) -> tuple[str, str] | None:
+        assert self.estado is not None
+        if self.estado.cancelamento_pedido(self.execucao.id):
+            return ("cancelado", "cancelada por você")
+        if JobStore.load().get(self.job) is None:
+            return ("job_removido", f"o job {self.job} foi apagado")
+        if dt.datetime.now() > self.limite:
+            return ("prazo", "o job passou do tempo limite")
+        return None
+
+    def _encerra_na_marra(self, motivo: tuple[str, str]) -> None:
+        """Grava o desfecho e mata o processo. O systemd sobe outro limpo.
+
+        Chegar aqui significa que a thread principal está presa numa chamada
+        que não devolve controle. Python não interrompe syscall bloqueada de
+        fora, então não existe saída elegante: o que existe é deixar o banco
+        consistente antes de sair, para ninguém herdar o estrago.
+        """
+        import os as _os
+
+        tipo, texto = motivo
+        try:
+            if tipo == "job_removido":
+                # Mesmo desfecho do caminho cooperativo: quem apagou o job não
+                # quer registro nem aviso. Deixar uma falha aqui ressuscitaria
+                # uma linha para um job que já não existe.
+                assert self.estado is not None
+                self.estado.delete_run(self.execucao.id)
+                if self.queue_id is not None:
+                    self.estado.solta_fila(self.queue_id)
+                return
+            self.execucao.result = RunResult.FAILED
+            self.execucao.finished_at = dt.datetime.now()
+            self.execucao.duration = (self.execucao.finished_at - self.execucao.started_at).total_seconds()
+            self.execucao.error_stage = self.execucao.error_stage or Stage.UPLOAD
+            self.execucao.error_cause = texto
+            self.execucao.error_got = (
+                "o worker ficou preso numa chamada que não devolveu controle,"
+                f" e foi encerrado {int(self.graca)}s depois do pedido"
+            )
+            self.execucao.error_fix = (
+                f"o artefato pode estar no staging. veja: backup-runner run-info {self.execucao.id}"
+            )
+            self.execucao.log.append((
+                self.execucao.finished_at.strftime("%H:%M:%S"), "vigia",
+                f"encerrado à força: {texto}",
+            ))
+            self.estado.update_run(self.execucao)
+            if self.queue_id is not None:
+                self.estado.solta_fila(self.queue_id)
+        finally:
+            # `_exit` e não `sys.exit`: a principal está bloqueada e um
+            # SystemExit nela não chegaria a ser processado. Está no `finally`
+            # para valer também no `return` acima e se a gravação falhar: uma
+            # vez decidido encerrar, o processo sai de qualquer forma.
+            _os._exit(_CODIGO_ENCERRADO_PELO_VIGIA)
+
+
+_CODIGO_ENCERRADO_PELO_VIGIA = 75
 
 
 class Sentinela:
-    """Vigia, durante a execução, as duas razões para parar antes da hora.
+    """A parte cooperativa da parada, chamada de dentro dos callbacks.
 
-    O prazo do job é uma delas. A outra é o job ter sido apagado no meio do
-    caminho: o worker guarda o `Job` em memória desde o começo, então sem
-    perguntar de novo ele terminaria feliz um backup que ninguém mais quer, e
-    ainda mandaria o aviso.
+    Ela não consulta disco nem relógio de parede: só lê o que o vigia já
+    decidiu. Antes esta classe relia o arquivo de jobs de dois em dois
+    segundos, o que punha entrada e saída no caminho quente do progresso sem
+    necessidade, e, pior, não funcionava justamente quando o callback parava de
+    ser chamado.
     """
 
-    def __init__(self, limite: dt.datetime, job: str) -> None:
-        self.limite, self.job = limite, job
-        self._ultima = 0.0
+    def __init__(self, vigia: Vigilancia) -> None:
+        self.vigia = vigia
 
     def __call__(self) -> None:
-        _checa_prazo(self.limite)
-        agora = time.monotonic()
-        if agora - self._ultima < INTERVALO_SENTINELA:
+        motivo = self.vigia.motivo
+        if motivo is None:
             return
-        self._ultima = agora
-        if JobStore.load().get(self.job) is None:
-            raise JobRemovido(self.job)
+        tipo, texto = motivo
+        if tipo == "cancelado":
+            raise Cancelado(texto)
+        if tipo == "job_removido":
+            raise JobRemovido(self.vigia.job)
+        raise TimeoutError(texto)
 
 
 # ----------------------------------------------------------------------------
@@ -559,7 +759,7 @@ def _limpa_staging(job: Job, pasta: Path, run: Run) -> None:
         pass
 
 
-def _escreve_manifest(run: Run, pasta: Path) -> None:
+def _escreve_manifest(run: Run, pasta: Path, sentinela: "Sentinela | None" = None) -> None:
     """Hash e tamanho do que foi produzido, gravados junto do artefato."""
     artefato = pasta / (run.artifact or "")
     dados = {
@@ -568,19 +768,26 @@ def _escreve_manifest(run: Run, pasta: Path) -> None:
         "folder": run.folder,
         "artifact": run.artifact,
         "bytes": artefato.stat().st_size if artefato.exists() else 0,
-        "sha256": _sha256(artefato),
+        "sha256": _sha256(artefato, sentinela),
         "ignored_regex": run.ignored_regex,
         "ignored_manual": run.ignored_manual,
     }
     (pasta / "manifest.json").write_text(json.dumps(dados, indent=2, ensure_ascii=False))
 
 
-def _sha256(caminho: Path) -> str:
+def _sha256(caminho: Path, sentinela: "Sentinela | None" = None) -> str:
+    """Hash do artefato, com a sentinela consultada no caminho.
+
+    A 455 MB/s nesta máquina, doze gigabytes são 27 segundos. Pouco, mas eram
+    27 segundos em que um cancelamento pedido não era obedecido.
+    """
     if not caminho.exists():
         return ""
     h = hashlib.sha256()
     with caminho.open("rb") as f:
         for bloco in iter(lambda: f.read(1024 * 1024), b""):
+            if sentinela is not None:
+                sentinela()
             h.update(bloco)
     return h.hexdigest()
 
@@ -620,6 +827,31 @@ def _desiste(run: Run, estado: State, pasta: Path) -> Resultado:
         pass
     estado.delete_run(run.id)
     return Resultado(run, True, f"{run.job} foi apagado durante a execução")
+
+
+def _cancela(run: Run, estado: State, pasta: Path, texto: str) -> Resultado:
+    """Encerra a pedido, deixando registro e sem avisar por email nem Slack.
+
+    Vira falha, porque o backup não aconteceu e o histórico não pode sugerir
+    que aconteceu. Mas não dispara aviso: quem cancelou está olhando, e receber
+    alerta do que você mesmo acabou de pedir é ruído.
+    """
+    run.result = RunResult.FAILED
+    run.finished_at = dt.datetime.now()
+    run.duration = (run.finished_at - run.started_at).total_seconds()
+    run.error_stage = run.error_stage or Stage.UPLOAD
+    run.error_cause = texto
+    run.error_fix = f"rode de novo quando quiser: backup-runner run {run.job}"
+    run.log.append((run.finished_at.strftime("%H:%M:%S"), "cancelado", texto))
+    shutil.rmtree(pasta, ignore_errors=True)
+    raiz = pasta.parent
+    try:
+        if raiz.is_dir() and not any(raiz.iterdir()):
+            raiz.rmdir()
+    except OSError:
+        pass
+    estado.update_run(run)
+    return Resultado(run, False, texto)
 
 
 def _avisa(job: Job, run: Run, *, recuperado: bool = False) -> None:

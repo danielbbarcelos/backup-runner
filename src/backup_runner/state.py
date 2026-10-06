@@ -340,19 +340,63 @@ class State:
             (stage, done, total, label, pid, _fmt(dt.datetime.now()), run_id),
         )
 
+    def bate_coracao(self, run_id: int) -> None:
+        """Só a hora, sem tocar em progresso.
+
+        É o vigia dizendo "estou aqui" independente de haver entrada e saída
+        rendendo. Separar isto do progresso é o que permite distinguir worker
+        empacado dentro de uma chamada de worker morto.
+        """
+        self.conn.execute(
+            "UPDATE runs SET heartbeat=?, prog_pid=COALESCE(prog_pid, ?) WHERE id=?",
+            (_fmt(dt.datetime.now()), os.getpid(), run_id),
+        )
+
+    def pede_cancelamento(self, run_id: int) -> bool:
+        """Marca o pedido. Devolve se havia execução para marcar."""
+        cur = self.conn.execute(
+            "UPDATE runs SET cancel_at=? WHERE id=? AND cancel_at IS NULL",
+            (_fmt(dt.datetime.now()), run_id),
+        )
+        return cur.rowcount > 0
+
+    def cancelamento_pedido(self, run_id: int) -> bool:
+        linha = self.conn.execute(
+            "SELECT cancel_at FROM runs WHERE id=?", (run_id,)
+        ).fetchone()
+        return bool(linha and linha["cancel_at"])
+
     def progresso_de(self, run_id: int) -> dict | None:
         """O progresso cru, sem montar a execução inteira."""
         linha = self.conn.execute(
             "SELECT prog_stage, prog_done, prog_total, prog_label, prog_pid, heartbeat,"
-            " started_at, job FROM runs WHERE id=?",
+            " cancel_at, started_at, job FROM runs WHERE id=?",
             (run_id,),
         ).fetchone()
         if linha is None:
             return None
         dados = dict(linha)
         dados["heartbeat"] = _parse(dados["heartbeat"])
+        dados["cancel_at"] = _parse(dados["cancel_at"])
         dados["started_at"] = _parse(dados["started_at"])
         return dados
+
+    def run_da_pasta(self, job: str, pasta: str) -> Run | None:
+        """A execução que produziu aquela pasta de staging.
+
+        A pasta é o timestamp de início, então a busca é por isso. Serve para a
+        varredura de staging saber se pode apagar: execução viva ou com envio
+        pendente é intocável.
+        """
+        try:
+            inicio = dt.datetime.strptime(pasta, "%Y-%m-%d_%H-%M-%S")
+        except ValueError:
+            return None
+        linha = self.conn.execute(
+            "SELECT * FROM runs WHERE job=? AND started_at=? ORDER BY id DESC LIMIT 1",
+            (job, _fmt(inicio)),
+        ).fetchone()
+        return _row_to_run(linha) if linha else None
 
     def get_run(self, run_id: int) -> Run | None:
         linha = self.conn.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
