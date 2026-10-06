@@ -127,6 +127,36 @@ execução, a limpeza é feita na hora por quem deu o comando.
 Execução com envio pendente também é cancelável, e aí cancelar quer dizer
 "pare de tentar reenviar".
 
+### Duas raias: um job não prende o outro
+
+Produzir e enviar são itens de fila separados, consumidos por laços
+independentes. Um envio de quatro horas ocupa só a raia de envio, então o dump
+de trinta segundos de outro job acontece durante ele.
+
+Medido com a raia de envio presa por um envio de 25 segundos, a produção do
+segundo job concluiu em **0,616 s**. Antes esperaria os 25 segundos inteiros.
+
+```
+fila           1 esperando em producao, 1 em envio
+```
+
+Dentro de cada raia o trabalho continua serial, de propósito: dois dumps
+pesados disputando disco demoram mais que os dois em sequência, e dois envios
+disputando a mesma rede não sobem mais rápido. Então uploads ainda esperam uns
+pelos outros, e é só isso que eles esperam.
+
+Um job também não concorre consigo mesmo. Qualquer trabalho dele em aberto, de
+qualquer raia, segura a janela nova, porque dois dumps do mesmo banco ao mesmo
+tempo não é paralelismo útil.
+
+Por padrão um processo cuida das duas raias, cada uma na sua thread, e é uma
+unidade de systemd só para manter de pé. Quem preferir separar:
+
+```
+backup-runner worker --raia producao
+backup-runner worker --raia envio
+```
+
 ### O que impede um job de travar
 
 Três coisas podiam fazer o programa parar de tirar backup continuando a dizer
@@ -316,7 +346,7 @@ menu e tudo é automatizável.
 | `backup-runner notify` | quais eventos avisam, e por onde |
 | `backup-runner health` | diagnóstico |
 | `backup-runner tick` | o que o cron chama |
-| `backup-runner worker` | o que o supervisord chama |
+| `backup-runner worker` | consome a fila, as duas raias (`--raia` para separar) |
 | `backup-runner install` | instala o agendamento |
 | `backup-runner self ...` | instala, remove e atualiza o programa |
 
