@@ -80,6 +80,81 @@ Cada linha responde a uma pergunta diferente:
   a marca como falha no minuto seguinte, para ela não bloquear os próximos
   backups fingindo que ainda roda.
 
+### Envio de arquivo grande, e retomada
+
+Um backup grande vira **um objeto só** no destino. O envio em partes é
+transporte, não divisão do backup: as partes ficam numa área de montagem do
+provedor, invisíveis para a listagem do bucket, e o objeto aparece de uma vez
+no `complete`. Isso é bom e vem de graça, porque a retenção nunca vê um
+artefato pela metade.
+
+Medido ao vivo contra o Spaces, com um envio interrompido no meio:
+
+```
+objetos no prefixo:  []       <- a listagem do bucket mostra zero
+multiparts abertos:  1
+   parte 1: 5,242,880 bytes
+   parte 2: 5,242,880 bytes
+```
+
+Como o `upload_id` e as partes concluídas ficam no banco, a tentativa seguinte
+sobe **só o que falta**. No mesmo teste, com duas de três partes já no
+provedor, a retomada enviou apenas a parte 3 e o objeto final saiu com ETag
+terminando em `-3`, que é a marca de objeto montado de três partes.
+
+A retomada existe porque o caminho anterior era tudo ou nada: um envio de doze
+gigabytes chegou a subir as 1500 partes em 3h45 e virou nada, porque a montagem
+final passou dos 60 segundos de tempo de leitura padrão do botocore e a
+biblioteca abortou o multipart.
+
+Destino local e SFTP não têm multipart, então ali o arquivo em andamento mora
+num `.parcial` e só ganha o nome definitivo quando está inteiro. Um pedaço com
+o nome final pareceria backup completo para a retenção e para quem restaurasse.
+O SFTP também retoma, conferindo o tamanho remoto e continuando de lá.
+
+### Interromper um backup
+
+```
+backup-runner cancel <nº>
+```
+
+Cooperativo, sem matar processo: o pedido vira uma marca no banco, o vigia a lê
+em segundos e a execução sai pelo caminho limpo, removendo o staging, soltando
+a fila e abortando o multipart remoto para não deixar parte pendurada custando.
+Medido num backup real: pedido e parada em 1,2s. Se não houver worker vivo na
+execução, a limpeza é feita na hora por quem deu o comando.
+
+Execução com envio pendente também é cancelável, e aí cancelar quer dizer
+"pare de tentar reenviar".
+
+### O que impede um job de travar
+
+Três coisas podiam fazer o programa parar de tirar backup continuando a dizer
+que estava tudo bem. As três foram fechadas, e cada uma tem teste de regressão.
+
+**Linha de fila presa.** Um worker que morresse entre pegar o item e encerrá-lo
+deixava a linha em `running` para sempre, e isso descartava toda janela futura
+daquele job. Não aparecia no `status`, que conta só os itens pendentes, e nem
+gerava aviso de janela perdida, porque o bloqueio vinha antes dessa lógica. O
+tick agora solta item cujo processo não existe mais. O critério é o pid e não a
+idade: um envio legítimo de seis horas tem claim antigo e está vivo, e tomar o
+item dele poria dois workers no mesmo backup.
+
+**Prazo que não era cobrado.** A batida de coração, a cobrança do prazo e o
+progresso viajavam todos no callback da biblioteca que fazia a entrada e saída,
+então quando ela bloqueava dentro de uma chamada as três paravam juntas. Agora
+um vigia em thread própria bate o coração e cobra o prazo com ou sem I/O
+rendendo, e "batida fresca sem progresso" virou um estado legível: empacado
+numa chamada, não morto. Se a execução não reagir ao pedido de parada, o vigia
+grava o desfecho e encerra o processo, nessa ordem, para ninguém herdar o
+estrago. O systemd sobe outro worker limpo.
+
+**Espera sem saída.** Uma execução que esgotava as tentativas de envio ficava
+em `pending` indefinidamente: sem reenvio, sem virar falha, sem aviso, e com o
+artefato no disco para sempre. Agora vira falha com causa explícita, avisa uma
+vez e libera o staging. O tick também varre staging de execução que já terminou,
+nunca tocando em execução viva nem em envio pendente.
+
 ### Compressão
 
 Sempre, e em fluxo. O `mysqldump` escreve direto no gzip, então o SQL cru nunca
@@ -233,6 +308,7 @@ menu e tudo é automatizável.
 | `backup-runner job <nome> --apagar` | apaga, pedindo o nome digitado |
 | `backup-runner run <nome>` | põe um job na fila agora |
 | `backup-runner watch` | acompanha ao vivo o backup em execução |
+| `backup-runner cancel <nº>` | interrompe uma execução em curso ou pendente |
 | `backup-runner history` | execuções (`--job`, `--falhas`, `--dias`) |
 | `backup-runner run-info <nº>` | detalhe de uma execução |
 | `backup-runner retry <nº>` | reenvia o artefato de uma execução pendente |

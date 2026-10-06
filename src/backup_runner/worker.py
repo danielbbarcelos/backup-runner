@@ -602,6 +602,7 @@ def _envia(
                 # O registro é o que transforma "recomeçar do zero" em
                 # "continuar de onde parou" se este envio falhar.
                 registro=PartesDeEnvio(estado, run.id),
+                on_phase=lambda fase: prog.etapa(fase, ligacao.name, total=a_enviar),
             )
         except TimeoutError:
             # Fica pendente em vez de virar falha: o artefato continua no
@@ -704,6 +705,7 @@ def reenvia_pendentes(job: Job, estado: State) -> Resultado:
                 # Mesmo registro da primeira tentativa: é por ele que as partes
                 # já no provedor são reaproveitadas em vez de reenviadas.
                 registro=PartesDeEnvio(estado, run.id),
+                on_phase=lambda fase: prog.etapa(fase, nome, total=a_enviar),
             )
         except Exception as exc:  # noqa: BLE001
             run.destinations_pending.append(nome)
@@ -855,6 +857,7 @@ ETAPA_DE = {
     "medindo": Stage.ARCHIVE,
     "lendo": Stage.ARCHIVE,
     "enviando": Stage.UPLOAD,
+    "reenviando": Stage.UPLOAD,
     "fechando envio": Stage.UPLOAD,
 }
 

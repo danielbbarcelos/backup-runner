@@ -293,3 +293,30 @@ def test_sem_registro_usa_o_caminho_do_boto3(tmp_path, monkeypatch):
 
     assert chamadas, "não usou upload_file"
     assert "create" not in prov.chamadas
+
+
+def test_a_montagem_tem_etapa_propria(tmp_path, monkeypatch):
+    """O ponto cego da tela: barra em 100% dizendo "enviando".
+
+    Entre a última parte e a resposta da montagem passaram minutos, em doze
+    gigabytes, e a tela não tinha como dizer que a espera era outra.
+    """
+    prov = Provedor()
+    motor, pasta, parte = monta(tmp_path, monkeypatch, prov)
+    fases: list[str] = []
+
+    motor.upload(pasta, "job/2026", registro=registro(), on_phase=fases.append)
+
+    assert fases == ["fechando envio"]
+
+
+def test_objeto_ja_completo_nao_anuncia_montagem(tmp_path, monkeypatch):
+    """Nada a montar, nada a anunciar."""
+    prov = Provedor()
+    motor, pasta, parte = monta(tmp_path, monkeypatch, prov)
+    prov.objetos["job/2026/dump.sql.gz"] = (pasta / "dump.sql.gz").stat().st_size
+    fases: list[str] = []
+
+    motor.upload(pasta, "job/2026", registro=registro(), on_phase=fases.append)
+
+    assert fases == []

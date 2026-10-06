@@ -114,7 +114,8 @@ class Registro(Protocol):
 class Backend(Protocol):
     def test(self) -> TestResult: ...
     def upload(self, pasta: Path, prefixo: str, on_progress: Callable[[int], None] | None,
-               registro: "Registro | None" = None) -> int: ...
+               registro: "Registro | None" = None,
+               on_phase: Callable[[str], None] | None = None) -> int: ...
     def list_runs(self, job: str) -> list[RemoteRun]: ...
     def delete_run(self, prefixo: str) -> int: ...
 
@@ -163,7 +164,7 @@ class LocalBackend:
         return TestResult(True, f"escreveu e apagou uma sonda em {levou:.1f}s", seconds=levou)
 
     def upload(self, pasta: Path, prefixo: str, on_progress=None,
-               registro: "Registro | None" = None) -> int:
+               registro: "Registro | None" = None, on_phase=None) -> int:
         alvo = self.base / prefixo
         alvo.mkdir(parents=True, exist_ok=True)
         enviados = 0
@@ -359,7 +360,7 @@ class S3Backend:
         return TestResult(True, f"gravou e apagou uma sonda em {levou:.1f}s", seconds=levou)
 
     def upload(self, pasta: Path, prefixo: str, on_progress=None,
-               registro: "Registro | None" = None) -> int:
+               registro: "Registro | None" = None, on_phase=None) -> int:
         cliente = self.cliente()
         enviados = 0
         for arquivo in sorted(pasta.iterdir()):
@@ -374,7 +375,8 @@ class S3Backend:
                     on_progress(inicio + feito)
 
             if registro is not None and tamanho >= LIMIAR_MULTIPART:
-                self._em_partes(cliente, arquivo, chave, tamanho, registro, progresso)
+                self._em_partes(cliente, arquivo, chave, tamanho, registro,
+                                progresso, on_phase)
             else:
                 # Sem registro para anotar, ou arquivo pequeno: o caminho do
                 # boto3 serve, e em arquivo pequeno retomar não compra nada.
@@ -396,7 +398,7 @@ class S3Backend:
     # -- envio em partes, com retomada --------------------------------
 
     def _em_partes(self, cliente, arquivo: Path, chave: str, tamanho: int,
-                   registro: "Registro", progresso) -> None:
+                   registro: "Registro", progresso, on_phase=None) -> None:
         """Sobe o arquivo em partes, continuando de onde parou.
 
         O caminho do `upload_file` é tudo ou nada: ele aborta o multipart
@@ -451,7 +453,7 @@ class S3Backend:
                 faltando, prontas, registro, progresso, feito,
             )
 
-        self._conclui(cliente, chave, upload_id, prontas, tamanho, registro)
+        self._conclui(cliente, chave, upload_id, prontas, tamanho, registro, on_phase)
         progresso(tamanho)
 
     def _sobe_faltando(self, cliente, arquivo: Path, chave: str, upload_id: str,
@@ -503,7 +505,8 @@ class S3Backend:
         return feito
 
     def _conclui(self, cliente, chave: str, upload_id: str,
-                 prontas: dict[int, str], tamanho: int, registro: "Registro") -> None:
+                 prontas: dict[int, str], tamanho: int, registro: "Registro",
+                 on_phase=None) -> None:
         """Manda o provedor montar o objeto, e trata o tempo estourado.
 
         Esta é a chamada que custou o backup de 2026-09-16. Ela acontece inteira
@@ -513,6 +516,10 @@ class S3Backend:
         provedor terminou de montar depois de o cliente desistir.
         """
         partes = [{"PartNumber": n, "ETag": prontas[n]} for n in sorted(prontas)]
+        # Daqui até a resposta, a barra ficaria em 100% dizendo "enviando", e em
+        # doze gigabytes isso foram minutos de tela mentindo sobre a etapa.
+        if on_phase is not None:
+            on_phase("fechando envio")
         try:
             cliente.complete_multipart_upload(
                 Bucket=self.destino.bucket, Key=chave, UploadId=upload_id,
@@ -714,7 +721,7 @@ class SFTPBackend:
                 sftp.mkdir(atual)
 
     def upload(self, pasta: Path, prefixo: str, on_progress=None,
-               registro: "Registro | None" = None) -> int:
+               registro: "Registro | None" = None, on_phase=None) -> int:
         cliente = self._conecta()
         enviados = 0
         try:
