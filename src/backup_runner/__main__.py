@@ -224,6 +224,60 @@ def cmd_run_info(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_cancel(args: argparse.Namespace) -> int:
+    """Interrompe uma execução em curso, ou desiste de um envio pendente."""
+    import time
+
+    from . import views
+    from .context import cancela_execucao
+    from .format import format_bytes
+    from .models import RunResult
+
+    ctx = _ctx()
+    run = ctx.state.get_run(args.numero)
+    if run is None:
+        c.erro(f"não existe execução {args.numero}")
+        c.nota("veja os números com: backup-runner history")
+        return 1
+
+    cancelaveis = (RunResult.RUNNING, RunResult.PENDING_UPLOAD)
+    if run.result not in cancelaveis:
+        c.erro(f"a execução {run.id} já terminou, com resultado {views.badge(run.result)}")
+        c.nota("só dá para cancelar o que está rodando ou com envio pendente")
+        return 1
+
+    o_que = ("interromper o backup em curso" if run.result is RunResult.RUNNING
+             else "desistir do envio pendente")
+    if not args.yes and not prompt.confirma(f"{o_que} de {run.job}", padrao=False):
+        c.info("cancelado")
+        return 1
+
+    feito = cancela_execucao(ctx, run)
+
+    if not feito["vivo"]:
+        c.sucesso(f"execução {run.id} encerrada")
+        if feito["staging"]:
+            c.info(f"{format_bytes(feito['staging'])} liberados do staging")
+        if run.result is RunResult.RUNNING:
+            c.nota("não havia worker ativo nela, então a limpeza foi feita agora")
+        return 0
+
+    # Worker vivo: ele obedece no próximo ciclo do vigia. Esperar um pouco e
+    # confirmar é melhor que mandar o usuário conferir sozinho.
+    c.info(f"pedido registrado, o worker (pid {feito['pid']}) vai parar em segundos")
+    limite = time.monotonic() + 30
+    while time.monotonic() < limite:
+        time.sleep(1.0)
+        atual = ctx.state.get_run(run.id)
+        if atual is None or atual.result not in cancelaveis:
+            c.sucesso(f"execução {run.id} interrompida")
+            return 0
+    c.aviso("o worker ainda não parou. se ele estiver preso numa chamada de rede,"
+            " o vigia o encerra por conta própria.")
+    c.nota(f"acompanhe com: backup-runner run-info {run.id}")
+    return 0
+
+
 def cmd_retry(args: argparse.Namespace) -> int:
     from .models import RunResult
 
@@ -697,6 +751,11 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("run-info", help="detalhe de uma execução")
     s.add_argument("numero", type=int)
     s.set_defaults(func=cmd_run_info)
+
+    s = sub.add_parser("cancel", help="interrompe uma execução em curso ou pendente")
+    s.add_argument("numero", type=int)
+    s.add_argument("--yes", action="store_true", help="não perguntar")
+    s.set_defaults(func=cmd_cancel)
 
     s = sub.add_parser("retry", help="reenvia o artefato de uma execução pendente")
     s.add_argument("numero", type=int)

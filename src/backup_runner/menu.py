@@ -116,6 +116,7 @@ def menu_acompanhar(ctx: Context) -> None:
             views.andamento(ctx)
             print()
             c.nota("ctrl-c para voltar ao menu, o backup continua rodando")
+            c.nota(f"para interromper: backup-runner cancel {alvo}")
             time.sleep(2.0)
     except KeyboardInterrupt:
         return

@@ -129,12 +129,16 @@ def andamento(ctx: Context) -> bool:
 
     atraso = (dt.datetime.now() - batida).total_seconds() if batida else None
     pid = prog.get("prog_pid")
+    if prog.get("cancel_at"):
+        c.linha("cancelamento", c.warn(
+            f"{c.SYM_WARN} pedido às {prog['cancel_at']:%H:%M:%S}, aguardando o worker parar"))
+
     if atraso is not None and atraso > SEM_SINAL_SEGUNDOS and not pid_vivo(pid):
         c.linha("sinal", c.danger(
             f"{c.SYM_FAIL} sem sinal há {format_relative(atraso)} e o processo {pid} sumiu"))
         print()
-        c.aviso("esta execução morreu sem terminar. o tick a marca como falha "
-                "no próximo minuto, ou force agora com: backup-runner tick")
+        c.aviso("esta execução morreu sem terminar. o tick a marca como falha no "
+                f"próximo minuto, ou encerre agora com: backup-runner cancel {run.id}")
     elif atraso is not None and atraso > SEM_SINAL_SEGUNDOS:
         c.linha("sinal", c.warn(
             f"{c.SYM_WARN} vivo (pid {pid}), mas sem progresso há {format_relative(atraso)}"))

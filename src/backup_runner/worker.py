@@ -506,7 +506,9 @@ class Vigilancia(threading.Thread):
             self.execucao.result = RunResult.FAILED
             self.execucao.finished_at = dt.datetime.now()
             self.execucao.duration = (self.execucao.finished_at - self.execucao.started_at).total_seconds()
-            self.execucao.error_stage = self.execucao.error_stage or Stage.UPLOAD
+            self.execucao.error_stage = (
+                self.execucao.error_stage or _etapa_atual(self.estado, self.execucao)
+            )
             self.execucao.error_cause = texto
             self.execucao.error_got = (
                 "o worker ficou preso numa chamada que não devolveu controle,"
@@ -829,6 +831,25 @@ def _desiste(run: Run, estado: State, pasta: Path) -> Resultado:
     return Resultado(run, True, f"{run.job} foi apagado durante a execução")
 
 
+# De que etapa é cada rótulo de progresso. Serve para o desfecho dizer onde a
+# execução estava, em vez de chutar "upload" para tudo.
+ETAPA_DE = {
+    "preparando": Stage.DUMP,
+    "lendo tabelas": Stage.DUMP,
+    "dump": Stage.DUMP,
+    "estrutura": Stage.DUMP,
+    "medindo": Stage.ARCHIVE,
+    "lendo": Stage.ARCHIVE,
+    "enviando": Stage.UPLOAD,
+    "fechando envio": Stage.UPLOAD,
+}
+
+
+def _etapa_atual(estado: State, run: Run) -> Stage:
+    bruto = estado.progresso_de(run.id) or {}
+    return ETAPA_DE.get(bruto.get("prog_stage") or "", Stage.UPLOAD)
+
+
 def _cancela(run: Run, estado: State, pasta: Path, texto: str) -> Resultado:
     """Encerra a pedido, deixando registro e sem avisar por email nem Slack.
 
@@ -839,7 +860,7 @@ def _cancela(run: Run, estado: State, pasta: Path, texto: str) -> Resultado:
     run.result = RunResult.FAILED
     run.finished_at = dt.datetime.now()
     run.duration = (run.finished_at - run.started_at).total_seconds()
-    run.error_stage = run.error_stage or Stage.UPLOAD
+    run.error_stage = run.error_stage or _etapa_atual(estado, run)
     run.error_cause = texto
     run.error_fix = f"rode de novo quando quiser: backup-runner run {run.job}"
     run.log.append((run.finished_at.strftime("%H:%M:%S"), "cancelado", texto))

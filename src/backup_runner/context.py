@@ -116,6 +116,67 @@ def encerra_job(ctx: "Context", nome: str) -> dict:
     return parado
 
 
+def cancela_execucao(ctx: "Context", run) -> dict:
+    """Interrompe uma execução, com worker vivo ou sem ele.
+
+    São dois caminhos, e os dois precisam existir. Com worker vivo, a marca no
+    banco basta: o vigia a lê em segundos e a execução sai pelo caminho limpo,
+    removendo o staging e gravando o desfecho. Matar o processo daqui deixaria
+    exatamente a sujeira que o estudo mandou parar de produzir, com artefato
+    órfão no disco e linha de fila presa.
+
+    Sem worker vivo, não há quem obedeça, então a limpeza é feita aqui mesmo.
+    É o caso de quem pediu cancelamento de uma execução que já estava morta sem
+    ninguém ter notado.
+
+    Execução com envio pendente também é cancelável, e aí cancelar quer dizer
+    "pare de tentar reenviar".
+    """
+    import shutil
+
+    from .config import staging_dir
+    from .models import RunResult
+    from .service import pid_vivo
+
+    bruto = ctx.state.progresso_de(run.id) or {}
+    pid = bruto.get("prog_pid")
+    vivo = run.result is RunResult.RUNNING and pid_vivo(pid)
+
+    ctx.state.pede_cancelamento(run.id)
+    feito = {"vivo": vivo, "pid": pid, "staging": 0}
+    if vivo:
+        # O vigia cuida do resto. Mexer no staging agora seria tirar o chão de
+        # quem ainda está escrevendo nele.
+        return feito
+
+    pasta = staging_dir() / run.job / run.folder
+    if pasta.is_dir():
+        feito["staging"] = sum(f.stat().st_size for f in pasta.rglob("*") if f.is_file())
+        shutil.rmtree(pasta, ignore_errors=True)
+        try:
+            if pasta.parent.is_dir() and not any(pasta.parent.iterdir()):
+                pasta.parent.rmdir()
+        except OSError:
+            pass
+
+    for item in ctx.state.filas_presas():
+        if item["job"] == run.job and not pid_vivo(item.get("claimed_pid")):
+            ctx.state.solta_fila(item["id"])
+
+    run.result = RunResult.FAILED
+    run.finished_at = run.finished_at or dt.datetime.now()
+    from .worker import _etapa_atual
+
+    run.error_stage = run.error_stage or _etapa_atual(ctx.state, run)
+    run.error_cause = "cancelada por você"
+    run.error_fix = f"rode de novo quando quiser: backup-runner run {run.job}"
+    run.log.append((dt.datetime.now().strftime("%H:%M:%S"), "cancelado",
+                    "cancelada sem worker ativo, limpeza feita na hora"))
+    ctx.state.update_run(run)
+    ctx.refresh()
+    return feito
+
+
 @dataclass
 class Context:
     jobs: JobStore = field(default_factory=JobStore.load)
