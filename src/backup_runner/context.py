@@ -143,11 +143,15 @@ def cancela_execucao(ctx: "Context", run) -> dict:
     vivo = run.result is RunResult.RUNNING and pid_vivo(pid)
 
     ctx.state.pede_cancelamento(run.id)
-    feito = {"vivo": vivo, "pid": pid, "staging": 0}
+    feito = {"vivo": vivo, "pid": pid, "staging": 0, "multiparts": 0}
     if vivo:
         # O vigia cuida do resto. Mexer no staging agora seria tirar o chão de
         # quem ainda está escrevendo nele.
         return feito
+
+    from .worker import aborta_multiparts
+
+    feito["multiparts"] = aborta_multiparts(ctx.state, run.id)
 
     pasta = staging_dir() / run.job / run.folder
     if pasta.is_dir():

@@ -516,6 +516,88 @@ class State:
 # Serialização do payload
 # ----------------------------------------------------------------------------
 
+class PartesDeEnvio:
+    """O que já subiu de um envio em partes, para poder continuar depois.
+
+    Existe porque `upload_file` do boto3 é tudo ou nada: ele aborta o multipart
+    quando falha, e um envio de doze gigabytes que levou três horas e quarenta
+    e cinco minutos virou nada por causa de um tempo de leitura estourado na
+    chamada final. O `upload_id` é o estado que precisa sobreviver ao processo
+    morrer, porque sem ele as partes já no provedor são inalcançáveis e só
+    restaria reenviar tudo.
+
+    É um índice, não a verdade. A verdade é o `list_parts` do provedor, e quem
+    retoma confere lá antes de decidir o que falta. Este registro serve para
+    saber **qual** multipart continuar.
+
+    Escrita só da thread que criou a conexão, como todo o resto do `State`. As
+    partes sobem em paralelo, mas quem as registra é a thread principal, ao
+    colher cada uma que termina.
+    """
+
+    def __init__(self, estado: "State", run_id: int) -> None:
+        self.estado, self.run_id = estado, run_id
+
+    def upload_id(self, destino: str, chave: str) -> str | None:
+        linha = self.estado.conn.execute(
+            "SELECT upload_id FROM upload_parts WHERE run_id=? AND destino=? AND chave=?"
+            " LIMIT 1",
+            (self.run_id, destino, chave),
+        ).fetchone()
+        return linha["upload_id"] if linha else None
+
+    def guarda_upload(self, destino: str, chave: str, upload_id: str) -> None:
+        """Registra o multipart aberto, antes de qualquer parte subir.
+
+        A linha de número zero é só um marcador: ela guarda o `upload_id` para
+        o caso de o processo morrer antes de a primeira parte terminar.
+        """
+        self.estado.conn.execute(
+            "INSERT OR REPLACE INTO upload_parts"
+            " (run_id, destino, chave, upload_id, part_number, etag, bytes)"
+            " VALUES (?, ?, ?, ?, 0, NULL, 0)",
+            (self.run_id, destino, chave, upload_id),
+        )
+
+    def guarda_parte(
+        self, destino: str, chave: str, upload_id: str, numero: int,
+        etag: str, tamanho: int,
+    ) -> None:
+        self.estado.conn.execute(
+            "INSERT OR REPLACE INTO upload_parts"
+            " (run_id, destino, chave, upload_id, part_number, etag, bytes)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (self.run_id, destino, chave, upload_id, numero, etag, tamanho),
+        )
+
+    def partes(self, destino: str, chave: str) -> dict[int, str]:
+        linhas = self.estado.conn.execute(
+            "SELECT part_number, etag FROM upload_parts"
+            " WHERE run_id=? AND destino=? AND chave=? AND part_number > 0",
+            (self.run_id, destino, chave),
+        ).fetchall()
+        return {l["part_number"]: l["etag"] for l in linhas if l["etag"]}
+
+    def esquece(self, destino: str, chave: str) -> None:
+        self.estado.conn.execute(
+            "DELETE FROM upload_parts WHERE run_id=? AND destino=? AND chave=?",
+            (self.run_id, destino, chave),
+        )
+
+    def abertos(self) -> list[dict[str, Any]]:
+        """Multiparts registrados e não concluídos, para abortar ao desistir.
+
+        Guardar o `upload_id` é assumir a responsabilidade de abortar: parte
+        pendurada no provedor ocupa espaço cobrado, e antes era o boto3 que
+        abortava sozinho.
+        """
+        linhas = self.estado.conn.execute(
+            "SELECT DISTINCT destino, chave, upload_id FROM upload_parts WHERE run_id=?",
+            (self.run_id,),
+        ).fetchall()
+        return [dict(l) for l in linhas]
+
+
 def _payload(run: Run) -> dict[str, Any]:
     return {
         "stages": [

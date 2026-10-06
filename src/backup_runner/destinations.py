@@ -95,9 +95,26 @@ def parse_pasta(nome: str) -> dt.datetime | None:
         return None
 
 
+class Registro(Protocol):
+    """Onde um envio em partes anota o que já subiu, para poder continuar.
+
+    Implementado por `state.PartesDeEnvio`. Está declarado aqui como protocolo
+    para este módulo não precisar conhecer o banco: ele sabe enviar, não sabe
+    onde o programa guarda histórico.
+    """
+
+    def upload_id(self, destino: str, chave: str) -> str | None: ...
+    def guarda_upload(self, destino: str, chave: str, upload_id: str) -> None: ...
+    def guarda_parte(self, destino: str, chave: str, upload_id: str,
+                     numero: int, etag: str, tamanho: int) -> None: ...
+    def partes(self, destino: str, chave: str) -> dict[int, str]: ...
+    def esquece(self, destino: str, chave: str) -> None: ...
+
+
 class Backend(Protocol):
     def test(self) -> TestResult: ...
-    def upload(self, pasta: Path, prefixo: str, on_progress: Callable[[int], None] | None) -> int: ...
+    def upload(self, pasta: Path, prefixo: str, on_progress: Callable[[int], None] | None,
+               registro: "Registro | None" = None) -> int: ...
     def list_runs(self, job: str) -> list[RemoteRun]: ...
     def delete_run(self, prefixo: str) -> int: ...
 
@@ -145,14 +162,23 @@ class LocalBackend:
         levou = (dt.datetime.now() - inicio).total_seconds()
         return TestResult(True, f"escreveu e apagou uma sonda em {levou:.1f}s", seconds=levou)
 
-    def upload(self, pasta: Path, prefixo: str, on_progress=None) -> int:
+    def upload(self, pasta: Path, prefixo: str, on_progress=None,
+               registro: "Registro | None" = None) -> int:
         alvo = self.base / prefixo
         alvo.mkdir(parents=True, exist_ok=True)
         enviados = 0
         for arquivo in sorted(pasta.iterdir()):
             if not arquivo.is_file():
                 continue
-            shutil.copy2(arquivo, alvo / arquivo.name)
+            # Copia para `.parcial` e renomeia no fim. Sem isto, uma cópia
+            # interrompida fica com o nome final, e aí ela parece artefato
+            # completo para a retenção e para quem for restaurar. O multipart
+            # do S3 dá essa atomicidade de graça, porque o objeto só aparece no
+            # `complete`; aqui ela tem que ser feita à mão.
+            final = alvo / arquivo.name
+            meio = alvo / (arquivo.name + PARCIAL)
+            shutil.copy2(arquivo, meio)
+            meio.replace(final)
             enviados += arquivo.stat().st_size
             if on_progress:
                 on_progress(enviados)
@@ -194,6 +220,33 @@ LIMIAR_MULTIPART = 16 * 1024 * 1024
 # O S3 aceita no máximo dez mil partes por objeto.
 MAX_PARTES = 10_000
 
+# Quantas partes sobem ao mesmo tempo. Dez é o que o boto3 usava por padrão, e
+# numa rede doméstica saturar mais que isso só aumenta a chance de uma falhar.
+CONCORRENCIA = 10
+
+# Sufixo do arquivo em andamento. Só o nome definitivo significa "backup
+# completo", e é por isso que a retenção e a restauração podem confiar nele.
+# O multipart do S3 dá essa atomicidade de graça, porque o objeto só aparece no
+# `complete`. No destino local e no SFTP ela tem que ser feita à mão.
+PARCIAL = ".parcial"
+
+
+def tamanho_de_parte(tamanho: int) -> int:
+    """Quantos bytes por parte, para um arquivo deste tamanho.
+
+    64 MB é o ponto de partida, e não os 8 MB padrão do boto3, porque o tempo
+    da montagem final no provedor cresce com o número de partes, e foi essa
+    montagem que estourou o tempo de leitura e custou um backup inteiro. Num
+    arquivo de doze gigabytes isto é a diferença entre 1500 partes e 182.
+
+    A parte dobra conforme necessário para caber nas dez mil que o S3 aceita,
+    então a conta continua valendo para arquivo de qualquer tamanho.
+    """
+    parte = 64 * 1024 * 1024
+    while tamanho / parte > MAX_PARTES:
+        parte *= 2
+    return parte
+
 
 def _transferencia(tamanho: int):
     """Como partir este arquivo, em função do tamanho dele.
@@ -209,9 +262,7 @@ def _transferencia(tamanho: int):
     """
     from boto3.s3.transfer import TransferConfig
 
-    parte = 64 * 1024 * 1024
-    while tamanho / parte > MAX_PARTES:
-        parte *= 2
+    parte = tamanho_de_parte(tamanho)
     return TransferConfig(
         multipart_threshold=LIMIAR_MULTIPART,
         multipart_chunksize=parte,
@@ -307,33 +358,220 @@ class S3Backend:
         levou = (dt.datetime.now() - inicio).total_seconds()
         return TestResult(True, f"gravou e apagou uma sonda em {levou:.1f}s", seconds=levou)
 
-    def upload(self, pasta: Path, prefixo: str, on_progress=None) -> int:
+    def upload(self, pasta: Path, prefixo: str, on_progress=None,
+               registro: "Registro | None" = None) -> int:
         cliente = self.cliente()
         enviados = 0
         for arquivo in sorted(pasta.iterdir()):
             if not arquivo.is_file():
                 continue
-            # O boto3 entrega o tamanho do bloco, não o total já enviado (o
-            # paramiko faz o contrário), então quem soma é este contador.
-            corrente = {"n": enviados}
+            chave = self._chave(prefixo, arquivo.name)
+            tamanho = arquivo.stat().st_size
+            base = enviados
 
-            def progresso(bloco: int, conta=corrente) -> None:
-                conta["n"] += bloco
+            def progresso(feito: int, inicio=base) -> None:
                 if on_progress:
-                    on_progress(conta["n"])
+                    on_progress(inicio + feito)
 
-            # upload_file faz multipart sozinho acima do limiar, com retomada
-            # das partes: um dump de 2 GB numa rede doméstica não recomeça do
-            # zero. O tamanho da parte é nosso, e não o padrão de 8 MB, porque
-            # é o número de partes que decide quanto o provedor demora para
-            # montar o objeto no fim.
-            cliente.upload_file(
-                str(arquivo), self.destino.bucket, self._chave(prefixo, arquivo.name),
-                Callback=progresso,
-                Config=_transferencia(arquivo.stat().st_size),
-            )
-            enviados += arquivo.stat().st_size
+            if registro is not None and tamanho >= LIMIAR_MULTIPART:
+                self._em_partes(cliente, arquivo, chave, tamanho, registro, progresso)
+            else:
+                # Sem registro para anotar, ou arquivo pequeno: o caminho do
+                # boto3 serve, e em arquivo pequeno retomar não compra nada.
+                # O boto3 entrega o tamanho do bloco, não o total já enviado (o
+                # paramiko faz o contrário), então quem soma é este contador.
+                conta = {"n": 0}
+
+                def bloco(n: int, c=conta) -> None:
+                    c["n"] += n
+                    progresso(c["n"])
+
+                cliente.upload_file(
+                    str(arquivo), self.destino.bucket, chave,
+                    Callback=bloco, Config=_transferencia(tamanho),
+                )
+            enviados += tamanho
         return enviados
+
+    # -- envio em partes, com retomada --------------------------------
+
+    def _em_partes(self, cliente, arquivo: Path, chave: str, tamanho: int,
+                   registro: "Registro", progresso) -> None:
+        """Sobe o arquivo em partes, continuando de onde parou.
+
+        O caminho do `upload_file` é tudo ou nada: ele aborta o multipart
+        quando falha, e foi assim que um envio de doze gigabytes, com as mil e
+        quinhentas partes já no provedor depois de três horas e quarenta e
+        cinco minutos, virou nada por um tempo de leitura estourado na montagem
+        final.
+
+        A ordem dos passos aqui não é arbitrária. Primeiro pergunta se o objeto
+        já existe, porque a montagem pode ter concluído do lado do provedor
+        **depois** de o cliente desistir, e foi exatamente esse o caso de
+        2026-09-16. Depois confere no provedor quais partes existem, porque o
+        provedor é a verdade e o registro local é só o índice de qual multipart
+        continuar.
+        """
+        nome = self.destino.name
+
+        if self._objeto_confere(cliente, chave, tamanho):
+            # Já está lá, inteiro. Acontece quando o `complete` deu certo e a
+            # resposta não chegou a tempo.
+            registro.esquece(nome, chave)
+            progresso(tamanho)
+            return
+
+        upload_id = registro.upload_id(nome, chave)
+        if upload_id is not None and not self._multipart_vivo(cliente, chave, upload_id):
+            # O provedor não conhece mais aquele multipart: expirou, foi
+            # abortado, ou já foi concluído. Começar de novo é a única saída.
+            registro.esquece(nome, chave)
+            upload_id = None
+
+        if upload_id is None:
+            upload_id = cliente.create_multipart_upload(
+                Bucket=self.destino.bucket, Key=chave,
+            )["UploadId"]
+            registro.guarda_upload(nome, chave, upload_id)
+
+        parte = tamanho_de_parte(tamanho)
+        total = max(1, -(-tamanho // parte))
+        prontas = self._partes_no_provedor(cliente, chave, upload_id)
+        for numero, etag in prontas.items():
+            registro.guarda_parte(nome, chave, upload_id, numero, etag,
+                                  min(parte, tamanho - (numero - 1) * parte))
+
+        feito = sum(min(parte, tamanho - (n - 1) * parte) for n in prontas)
+        progresso(feito)
+        faltando = [n for n in range(1, total + 1) if n not in prontas]
+
+        if faltando:
+            self._sobe_faltando(
+                cliente, arquivo, chave, upload_id, parte, tamanho,
+                faltando, prontas, registro, progresso, feito,
+            )
+
+        self._conclui(cliente, chave, upload_id, prontas, tamanho, registro)
+        progresso(tamanho)
+
+    def _sobe_faltando(self, cliente, arquivo: Path, chave: str, upload_id: str,
+                       parte: int, tamanho: int, faltando: list[int],
+                       prontas: dict[int, str], registro: "Registro",
+                       progresso, feito: int) -> int:
+        """Sobe em paralelo as partes que faltam, anotando cada uma que chega.
+
+        Quem anota é esta thread, não as que sobem: a conexão do SQLite não
+        atravessa thread, e colher no `as_completed` mantém a escrita onde ela
+        pode acontecer. Parte anotada é parte que não se reenvia.
+        """
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        nome = self.destino.name
+
+        def sobe(numero: int) -> tuple[int, str, int]:
+            inicio = (numero - 1) * parte
+            quanto = min(parte, tamanho - inicio)
+            with arquivo.open("rb") as f:
+                f.seek(inicio)
+                corpo = f.read(quanto)
+            r = cliente.upload_part(
+                Bucket=self.destino.bucket, Key=chave, UploadId=upload_id,
+                PartNumber=numero, Body=corpo,
+            )
+            return numero, r["ETag"], quanto
+
+        erro: Exception | None = None
+        with ThreadPoolExecutor(max_workers=CONCORRENCIA) as pool:
+            futuros = [pool.submit(sobe, n) for n in faltando]
+            for fut in as_completed(futuros):
+                # Colhe todos antes de levantar. Soltar a exceção no meio do
+                # laço deixaria sem registro as partes que deram certo, e com
+                # dez subindo em paralelo uma falha descartaria até nove
+                # sucessos. O `list_parts` da próxima tentativa as recuperaria,
+                # mas jogar fora trabalho concluído não é opção.
+                try:
+                    numero, etag, quanto = fut.result()
+                except Exception as exc:  # noqa: BLE001
+                    erro = erro or exc
+                    continue
+                prontas[numero] = etag
+                registro.guarda_parte(nome, chave, upload_id, numero, etag, quanto)
+                feito += quanto
+                progresso(feito)
+        if erro is not None:
+            raise erro
+        return feito
+
+    def _conclui(self, cliente, chave: str, upload_id: str,
+                 prontas: dict[int, str], tamanho: int, registro: "Registro") -> None:
+        """Manda o provedor montar o objeto, e trata o tempo estourado.
+
+        Esta é a chamada que custou o backup de 2026-09-16. Ela acontece inteira
+        dentro de uma resposta HTTP, e o tempo dela cresce com o número de
+        partes. Se estourar, **não se aborta**: o registro fica, a tentativa
+        seguinte pergunta se o objeto existe, e normalmente ele existe, porque o
+        provedor terminou de montar depois de o cliente desistir.
+        """
+        partes = [{"PartNumber": n, "ETag": prontas[n]} for n in sorted(prontas)]
+        try:
+            cliente.complete_multipart_upload(
+                Bucket=self.destino.bucket, Key=chave, UploadId=upload_id,
+                MultipartUpload={"Parts": partes},
+            )
+        except Exception:
+            if self._objeto_confere(cliente, chave, tamanho):
+                registro.esquece(self.destino.name, chave)
+                return
+            raise
+        registro.esquece(self.destino.name, chave)
+
+    # -- perguntas ao provedor ----------------------------------------
+
+    def _objeto_confere(self, cliente, chave: str, tamanho: int) -> bool:
+        """O objeto já está lá, com o tamanho certo?"""
+        try:
+            r = cliente.head_object(Bucket=self.destino.bucket, Key=chave)
+        except Exception:
+            return False
+        return int(r.get("ContentLength", -1)) == tamanho
+
+    def _multipart_vivo(self, cliente, chave: str, upload_id: str) -> bool:
+        try:
+            cliente.list_parts(
+                Bucket=self.destino.bucket, Key=chave, UploadId=upload_id, MaxParts=1,
+            )
+        except Exception:
+            return False
+        return True
+
+    def _partes_no_provedor(self, cliente, chave: str, upload_id: str) -> dict[int, str]:
+        """O que o provedor diz que já recebeu. É esta a verdade."""
+        prontas: dict[int, str] = {}
+        marcador = None
+        while True:
+            kw = dict(Bucket=self.destino.bucket, Key=chave, UploadId=upload_id)
+            if marcador is not None:
+                kw["PartNumberMarker"] = marcador
+            r = cliente.list_parts(**kw)
+            for parte in r.get("Parts", []):
+                prontas[parte["PartNumber"]] = parte["ETag"]
+            if not r.get("IsTruncated"):
+                return prontas
+            marcador = r["NextPartNumberMarker"]
+
+    def aborta(self, chave: str, upload_id: str) -> bool:
+        """Descarta um multipart pendente, para não pagar por parte pendurada.
+
+        Guardar o `upload_id` para retomar é assumir esta responsabilidade:
+        antes era o boto3 que abortava sozinho ao falhar.
+        """
+        try:
+            self.cliente().abort_multipart_upload(
+                Bucket=self.destino.bucket, Key=chave, UploadId=upload_id,
+            )
+        except Exception:
+            return False
+        return True
 
     def list_runs(self, job: str) -> list[RemoteRun]:
         cliente = self.cliente()
@@ -475,27 +713,74 @@ class SFTPBackend:
             except IOError:
                 sftp.mkdir(atual)
 
-    def upload(self, pasta: Path, prefixo: str, on_progress=None) -> int:
+    def upload(self, pasta: Path, prefixo: str, on_progress=None,
+               registro: "Registro | None" = None) -> int:
         cliente = self._conecta()
         enviados = 0
         try:
             sftp = cliente.open_sftp()
+            # Sem isto, transferência parada fica parada para sempre: o
+            # `timeout` do connect cobre só a conexão, e um destino que congela
+            # no meio travava o worker sem prazo nenhum, do mesmo jeito que o
+            # S3 travava antes do `read_timeout`.
+            canal = sftp.get_channel()
+            if canal is not None:
+                canal.settimeout(READ_TIMEOUT)
             alvo = f"{self.destino.remote_path.rstrip('/')}/{prefixo}"
             self._garante_pasta(sftp, alvo)
             for arquivo in sorted(pasta.iterdir()):
                 if not arquivo.is_file():
                     continue
-                acumulado = enviados
-
-                def progresso(feito: int, total: int, base=acumulado) -> None:
-                    if on_progress:
-                        on_progress(base + feito)
-
-                sftp.put(str(arquivo), f"{alvo}/{arquivo.name}", callback=progresso)
-                enviados += arquivo.stat().st_size
+                enviados += self._envia_um(sftp, arquivo, alvo, enviados, on_progress)
         finally:
             cliente.close()
         return enviados
+
+    def _envia_um(self, sftp, arquivo: Path, alvo: str, base: int, on_progress) -> int:
+        """Sobe um arquivo, continuando de onde parou se já houver pedaço lá.
+
+        O nome só vira o definitivo quando o arquivo está inteiro. O arquivo em
+        andamento mora no `.parcial`, que é o que torna a retomada segura: um
+        pedaço com o nome final pareceria backup completo para a retenção.
+        """
+        tamanho = arquivo.stat().st_size
+        final = f"{alvo}/{arquivo.name}"
+        meio = final + PARCIAL
+
+        if self._tamanho_remoto(sftp, final) == tamanho:
+            if on_progress:
+                on_progress(base + tamanho)
+            return tamanho
+
+        feito = self._tamanho_remoto(sftp, meio) or 0
+        if feito > tamanho:
+            feito = 0                      # pedaço maior que a origem não serve
+        modo = "ab" if feito else "wb"
+
+        with arquivo.open("rb") as origem, sftp.open(meio, modo) as destino:
+            destino.set_pipelined(True)
+            origem.seek(feito)
+            while True:
+                bloco = origem.read(1024 * 1024)
+                if not bloco:
+                    break
+                destino.write(bloco)
+                feito += len(bloco)
+                if on_progress:
+                    on_progress(base + feito)
+
+        try:
+            sftp.remove(final)
+        except IOError:
+            pass
+        sftp.rename(meio, final)
+        return tamanho
+
+    def _tamanho_remoto(self, sftp, caminho: str) -> int | None:
+        try:
+            return sftp.stat(caminho).st_size
+        except IOError:
+            return None
 
     def list_runs(self, job: str) -> list[RemoteRun]:
         cliente = self._conecta()

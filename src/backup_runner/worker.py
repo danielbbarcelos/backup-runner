@@ -39,7 +39,7 @@ from .models import (
     StageRecord,
     StageState,
 )
-from .state import State
+from .state import PartesDeEnvio, State
 
 
 class Cancelado(Exception):
@@ -597,7 +597,12 @@ def _envia(
 
         try:
             motor = destinations.backend(destino)
-            enviados = motor.upload(pasta, prefixo, on_progress=andamento)
+            enviados = motor.upload(
+                pasta, prefixo, on_progress=andamento,
+                # O registro é o que transforma "recomeçar do zero" em
+                # "continuar de onde parou" se este envio falhar.
+                registro=PartesDeEnvio(estado, run.id),
+            )
         except TimeoutError:
             # Fica pendente em vez de virar falha: o artefato continua no
             # staging e o tick reenfileira só o envio, sem refazer o backup.
@@ -684,14 +689,22 @@ def reenvia_pendentes(job: Job, estado: State) -> Resultado:
     run.retry_count += 1
     destinos = DestinationStore.load()
     prefixo = f"{job.name}/{run.folder}"
+    a_enviar = sum(f.stat().st_size for f in pasta.iterdir() if f.is_file())
+    prog = Progresso(estado, run.id)
 
     for nome in faltando:
         destino = destinos.get(nome)
         if destino is None:
             run.destinations_pending.append(nome)
             continue
+        prog.etapa("reenviando", f"{nome}: {destino.location()}", total=a_enviar)
         try:
-            enviados = destinations.backend(destino).upload(pasta, prefixo)
+            enviados = destinations.backend(destino).upload(
+                pasta, prefixo, on_progress=prog.anda,
+                # Mesmo registro da primeira tentativa: é por ele que as partes
+                # já no provedor são reaproveitadas em vez de reenviadas.
+                registro=PartesDeEnvio(estado, run.id),
+            )
         except Exception as exc:  # noqa: BLE001
             run.destinations_pending.append(nome)
             run.error_got = destinations._resumo_erro(exc)
@@ -820,6 +833,7 @@ def _desiste(run: Run, estado: State, pasta: Path) -> Resultado:
 
     O artefato pela metade vai junto: ele só existia para este job.
     """
+    aborta_multiparts(estado, run.id)
     shutil.rmtree(pasta, ignore_errors=True)
     raiz = pasta.parent
     try:
@@ -850,6 +864,33 @@ def _etapa_atual(estado: State, run: Run) -> Stage:
     return ETAPA_DE.get(bruto.get("prog_stage") or "", Stage.UPLOAD)
 
 
+def aborta_multiparts(estado: State, run_id: int) -> int:
+    """Descarta os envios em partes registrados desta execução.
+
+    Guardar o `upload_id` para poder retomar é assumir a responsabilidade de
+    abortar: parte pendurada no provedor ocupa espaço cobrado, e antes era o
+    boto3 que abortava sozinho ao falhar. Chamado só quando se desiste de vez,
+    nunca entre tentativas, porque é justamente entre tentativas que as partes
+    precisam continuar lá.
+    """
+    registro = PartesDeEnvio(estado, run_id)
+    abertos = registro.abertos()
+    if not abertos:
+        return 0
+
+    destinos = DestinationStore.load()
+    abortados = 0
+    for item in abertos:
+        destino = destinos.get(item["destino"])
+        if destino is None:
+            continue
+        motor = destinations.backend(destino)
+        if hasattr(motor, "aborta") and motor.aborta(item["chave"], item["upload_id"]):
+            abortados += 1
+        registro.esquece(item["destino"], item["chave"])
+    return abortados
+
+
 def _cancela(run: Run, estado: State, pasta: Path, texto: str) -> Resultado:
     """Encerra a pedido, deixando registro e sem avisar por email nem Slack.
 
@@ -864,6 +905,7 @@ def _cancela(run: Run, estado: State, pasta: Path, texto: str) -> Resultado:
     run.error_cause = texto
     run.error_fix = f"rode de novo quando quiser: backup-runner run {run.job}"
     run.log.append((run.finished_at.strftime("%H:%M:%S"), "cancelado", texto))
+    aborta_multiparts(estado, run.id)
     shutil.rmtree(pasta, ignore_errors=True)
     raiz = pasta.parent
     try:

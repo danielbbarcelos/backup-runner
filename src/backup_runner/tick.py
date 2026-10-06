@@ -290,6 +290,12 @@ def _desiste_do_pendente(
     run.error_fix = f"resolva o destino e rode de novo: backup-runner run {run.job}"
     run.log.append((agora.strftime("%H:%M:%S"), "tick", "envio abandonado, staging liberado"))
 
+    from .worker import aborta_multiparts
+
+    # Desistiu de vez: as partes no provedor não servem mais a ninguém e
+    # custariam espaço indefinidamente.
+    aborta_multiparts(estado, run.id)
+
     pasta = staging_dir() / run.job / run.folder
     shutil.rmtree(pasta, ignore_errors=True)
     raiz = pasta.parent
