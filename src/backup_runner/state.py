@@ -100,6 +100,16 @@ CREATE TABLE IF NOT EXISTS upload_parts (
 CREATE INDEX IF NOT EXISTS partes_envio ON upload_parts(run_id, destino, chave);
 """
 
+# As duas raias da fila. Um envio de quatro horas não pode mais atrasar o dump
+# de trinta segundos de outro job, e por isso produzir e enviar são itens
+# separados, consumidos por laços independentes.
+#
+# `upload_retry` continua aceito na raia de envio porque é o nome que o reenvio
+# manual e os bancos antigos usam, e renomear não compraria nada.
+RAIA_PRODUCAO = ("producao",)
+RAIA_ENVIO = ("envio", "upload_retry")
+RAIAS = {"producao": RAIA_PRODUCAO, "envio": RAIA_ENVIO}
+
 ISO = "%Y-%m-%dT%H:%M:%S"
 
 
@@ -149,6 +159,12 @@ class State:
                 "claimed_at": "TEXT",
             },
         }
+        # `full` virou `producao` quando produzir e enviar passaram a ser itens
+        # separados. Renomear no lugar é obrigatório: deixar o nome antigo
+        # conviver com o novo criaria duas linhas para a mesma janela, e o
+        # backup rodaria duas vezes.
+        self.conn.execute("UPDATE queue SET kind='producao' WHERE kind='full'")
+
         for tabela, colunas in novas.items():
             existentes = {
                 linha["name"]
@@ -173,7 +189,8 @@ class State:
     # Fila
     # ------------------------------------------------------------------
 
-    def enqueue(self, job: str, due_at: dt.datetime, *, late: bool = False, kind: str = "full") -> int | None:
+    def enqueue(self, job: str, due_at: dt.datetime, *, late: bool = False,
+                kind: str = "producao", run_id: int | None = None) -> int | None:
         """Enfileira uma janela. Devolve None se ela já estava na fila.
 
         A chave única (job, due_at, kind) é o que torna o tick idempotente: ele
@@ -182,25 +199,34 @@ class State:
         agora = dt.datetime.now()
         try:
             cur = self.conn.execute(
-                "INSERT INTO queue (job, due_at, enqueued_at, status, late, kind)"
-                " VALUES (?, ?, ?, 'pending', ?, ?)",
-                (job, _fmt(due_at), _fmt(agora), int(late), kind),
+                "INSERT INTO queue (job, due_at, enqueued_at, status, late, kind, run_id)"
+                " VALUES (?, ?, ?, 'pending', ?, ?, ?)",
+                (job, _fmt(due_at), _fmt(agora), int(late), kind, run_id),
             )
             return int(cur.lastrowid or 0)
         except sqlite3.IntegrityError:
             return None
 
-    def claim_next(self) -> dict[str, Any] | None:
+    def claim_next(self, kinds: Iterable[str] | None = None) -> dict[str, Any] | None:
         """Pega o próximo item pendente, em transação.
 
         BEGIN IMMEDIATE trava a escrita antes de ler, então dois workers (ou um
-        worker e um tick teimoso) nunca levam o mesmo item.
+        worker e um tick teimoso) nunca levam o mesmo item. É isto que torna
+        seguro ter um laço por raia, cada um na sua thread.
+
+        Sem `kinds`, pega de qualquer raia. É o que o `--uma-vez` usa.
         """
         self.conn.execute("BEGIN IMMEDIATE")
         try:
-            linha = self.conn.execute(
-                "SELECT * FROM queue WHERE status='pending' ORDER BY due_at LIMIT 1"
-            ).fetchone()
+            if kinds:
+                marcas = ",".join("?" for _ in kinds)
+                sql = (f"SELECT * FROM queue WHERE status='pending' AND kind IN ({marcas})"
+                       " ORDER BY due_at LIMIT 1")
+                linha = self.conn.execute(sql, tuple(kinds)).fetchone()
+            else:
+                linha = self.conn.execute(
+                    "SELECT * FROM queue WHERE status='pending' ORDER BY due_at LIMIT 1"
+                ).fetchone()
             if linha is None:
                 self.conn.execute("COMMIT")
                 return None
@@ -254,6 +280,25 @@ class State:
         self.conn.execute(
             "UPDATE queue SET status='abandoned' WHERE id=?", (queue_id,)
         )
+
+    def queue_por_raia(self) -> dict[str, dict[str, int]]:
+        """Itens esperando e em andamento, por raia.
+
+        Contar os dois importa, e separado. "Fila vazia" escondendo trabalho é
+        o que fez um backup parar em silêncio: o item preso por worker morto
+        fica em 'running', e um resumo que conta só os pendentes diz que não há
+        nada enquanto aquele item descarta toda janela futura do job.
+        """
+        contas = {nome: {"esperando": 0, "andando": 0} for nome in RAIAS}
+        for item in self.conn.execute(
+            "SELECT kind, status, COUNT(*) AS n FROM queue"
+            " WHERE status IN ('pending','running') GROUP BY kind, status"
+        ):
+            campo = "esperando" if item["status"] == "pending" else "andando"
+            for nome, tipos in RAIAS.items():
+                if item["kind"] in tipos:
+                    contas[nome][campo] += item["n"]
+        return contas
 
     def queue_size(self) -> int:
         linha = self.conn.execute(

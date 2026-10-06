@@ -72,7 +72,6 @@ def test_cancelamento_interrompe_backup_em_curso_sem_deixar_lixo(tmp_path, monke
 
     estado = State()
     estado.enqueue("demorado", dt.datetime.now())
-    item = estado.claim_next()
 
     # Pede o cancelamento de fora, como o comando faria, enquanto roda.
     def pede():
@@ -87,7 +86,7 @@ def test_cancelamento_interrompe_backup_em_curso_sem_deixar_lixo(tmp_path, monke
 
     t = threading.Thread(target=pede)
     t.start()
-    resultado = worker.executa_item(item, estado)
+    resultado = worker.drena(estado)[-1]
     t.join()
 
     final = estado.get_run(resultado.run.id)

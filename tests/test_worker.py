@@ -87,15 +87,19 @@ def mysqldump_falso(tmp_path, monkeypatch):
 
 
 def roda_job(job: Job) -> tuple:
-    """Enfileira e processa, devolvendo (resultado, execução)."""
+    """Enfileira e processa até a fila esvaziar, devolvendo (resultado, execução).
+
+    Drenar e não processar um item só: produzir e enviar são itens separados,
+    em raias diferentes, então um backup completo são dois. É de propósito que
+    o helper atravesse as duas fases, porque é isso que o job faz na prática.
+    """
     from backup_runner import worker
 
     JobStore.load().put(job)
     estado = State()
     estado.enqueue(job.name, dt.datetime.now())
-    item = estado.claim_next()
-    resultado = worker.executa_item(item, estado)
-    estado.finish_queue_item(item["id"], resultado.run.id)
+    feitos = worker.drena(estado)
+    resultado = feitos[-1]
     run = estado.get_run(resultado.run.id)
     estado.close()
     return resultado, run

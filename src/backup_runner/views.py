@@ -169,7 +169,14 @@ def resumo(ctx: Context) -> None:
         c.ok(f"{c.SYM_OK} rodando, pid {worker.pid}") if worker.running
         else c.danger(f"{c.SYM_FAIL} {worker.message or 'parado'}"),
     )
-    c.linha("fila", "vazia" if ctx.queue_size == 0 else f"{ctx.queue_size} esperando")
+    raias = ctx.state.queue_por_raia()
+    partes = []
+    for nome, contas in raias.items():
+        if contas["andando"]:
+            partes.append(f"{contas['andando']} em {nome}")
+        if contas["esperando"]:
+            partes.append(f"{contas['esperando']} esperando em {nome}")
+    c.linha("fila", ", ".join(partes) if partes else "vazia")
 
     proxima = ctx.next_overall()
     if proxima is not None:

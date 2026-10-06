@@ -143,8 +143,7 @@ def test_worker_para_e_cala_quando_o_job_some_no_meio(tmp_path, monkeypatch):
 
     estado = State()
     estado.enqueue("alvo", dt.datetime.now())
-    item = estado.claim_next()
-    resultado = worker.executa_item(item, estado)
+    resultado = worker.drena(estado)[-1]
 
     assert resultado.ok
     assert "apagado" in resultado.mensagem
@@ -183,9 +182,12 @@ def test_job_que_existe_continua_avisando(tmp_path, monkeypatch):
 
     estado = State()
     estado.enqueue("alvo", dt.datetime.now())
-    item = estado.claim_next()
-    resultado = worker.executa_item(item, estado)
+    feitos = worker.drena(estado)
 
-    assert resultado.ok
+    assert all(r.ok for r in feitos)
+    # Duas fases, um aviso: ele sai no fim do envio, que é quando o backup
+    # realmente terminou. Avisar no fim da produção diria que acabou algo que
+    # ainda não chegou ao destino.
+    assert len(feitos) == 2, "produção e envio são itens separados"
     assert len(avisos) == 1
     estado.close()

@@ -229,8 +229,7 @@ def test_job_de_arquivos_registra_progresso_durante_a_execucao(tmp_path, monkeyp
 
     estado = State()
     estado.enqueue(job.name, dt.datetime.now())
-    item = estado.claim_next()
-    resultado = worker.executa_item(item, estado)
+    resultado = worker.drena(estado)[-1]
     estado.close()
 
     assert resultado.ok

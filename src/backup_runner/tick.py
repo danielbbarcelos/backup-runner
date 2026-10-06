@@ -69,6 +69,7 @@ def run_tick(agora: dt.datetime | None = None, *, state: State | None = None) ->
         # a linha fantasma ainda faz `ja_na_fila` descartar a janela deste tick.
         _solta_filas_presas(estado, resultado)
         _fecha_orfas(estado, resultado)
+        _reenfileira_envios_perdidos(estado, resultado)
         _varre_staging(estado, settings, agora, resultado)
         for job in jobs.list():
             if not job.enabled:
@@ -76,10 +77,33 @@ def run_tick(agora: dt.datetime | None = None, *, state: State | None = None) ->
                 continue
             _avaliar(job, agora, estado, resultado)
         _reenvios_pendentes(agora, settings, estado, resultado)
+        _encerra_esperas_vencidas(estado, settings, agora, resultado)
     finally:
         if state is None:
             estado.close()
     return resultado
+
+
+def _reenfileira_envios_perdidos(estado: State, resultado: TickResult) -> None:
+    """Artefato pronto e sem item de envio na fila volta para a fila.
+
+    Com produção e envio separados, existe um intervalo em que a execução está
+    `QUEUED` e depende de um item de fila para seguir. Se esse item sumir, por
+    worker morto no momento errado ou por banco mexido à mão, o backup fica
+    pronto no disco e nunca sai dali.
+
+    Reenfileirar é mais honesto que falhar: o artefato existe e custou tempo de
+    banco. Quem decide desistir é o prazo do staging, lá em `_varre_staging`.
+    """
+    esperando = [r for r in estado.runs(limit=200) if r.result is RunResult.QUEUED]
+    if not esperando:
+        return
+    na_fila = {f["job"] for f in estado.queue_pending()}
+    for run in esperando:
+        if run.job in na_fila:
+            continue
+        if estado.enqueue(run.job, run.started_at, kind="envio", run_id=run.id) is not None:
+            resultado.reenvios.append(run.job)
 
 
 def _varre_staging(
@@ -109,7 +133,10 @@ def _varre_staging(
     if not raiz.is_dir():
         return
 
-    intocaveis = {RR.RUNNING, RR.PENDING_UPLOAD}
+    # QUEUED entra aqui porque é o estado do intervalo entre produzir e enviar:
+    # apagar o artefato de quem está só esperando a raia de envio seria
+    # destruir backup pronto.
+    intocaveis = {RR.RUNNING, RR.QUEUED, RR.PENDING_UPLOAD}
     corte = dt.timedelta(hours=settings.staging_hold_hours)
 
     for pasta_job in sorted(p for p in raiz.iterdir() if p.is_dir()):
@@ -205,11 +232,14 @@ def _avaliar(job: Job, agora: dt.datetime, estado: State, resultado: TickResult)
     if ultima is not None and ultima.started_at >= janela:
         return
 
-    ja_na_fila = any(
-        f["job"] == job.name and f["kind"] == "full"
-        for f in estado.queue_pending()
-    )
-    if ja_na_fila:
+    # Um job não concorre consigo mesmo. Qualquer trabalho dele em aberto, de
+    # qualquer raia, segura a janela nova: dois dumps do mesmo banco ao mesmo
+    # tempo, ou dois envios do mesmo job disputando a rede, não é paralelismo
+    # útil. O que as raias liberam é job diferente andar junto, e isso continua
+    # valendo porque esta checagem é por nome de job.
+    if any(f["job"] == job.name for f in estado.queue_pending()):
+        return
+    if ultima is not None and ultima.result in (RunResult.RUNNING, RunResult.QUEUED):
         return
 
     atraso = (agora - janela).total_seconds() / 60
@@ -262,6 +292,23 @@ def _reenvios_pendentes(agora: dt.datetime, settings: Settings, estado: State, r
             resultado.reenvios.append(run.job)
 
 
+def _encerra_esperas_vencidas(
+    estado: State, settings: Settings, agora: dt.datetime, resultado: TickResult,
+) -> None:
+    """Artefato pronto que nunca saiu do disco, passado o prazo do staging.
+
+    Toda espera precisa de prazo para um estado terminal, e a espera entre
+    produzir e enviar não é exceção: sem isto, uma execução `QUEUED` cujo envio
+    nunca acontecesse ficaria pronta no disco para sempre, e a varredura de
+    staging não a tocaria justamente porque `QUEUED` é intocável lá.
+    """
+    corte = dt.timedelta(hours=settings.staging_hold_hours)
+    for run in estado.runs(results=[RunResult.QUEUED], limit=200):
+        if agora - run.started_at <= corte:
+            continue
+        _desiste_do_pendente(run, estado, resultado, agora, settings)
+
+
 def _desiste_do_pendente(
     run: Run, estado: State, resultado: TickResult,
     agora: dt.datetime, settings: Settings,
@@ -279,6 +326,9 @@ def _desiste_do_pendente(
     faltando = ", ".join(run.destinations_pending) or "o destino"
     if run.retry_count >= MAX_REENVIOS:
         motivo = f"{run.retry_count} tentativas de envio para {faltando}, todas falharam"
+    elif run.result is RunResult.QUEUED:
+        motivo = (f"o artefato ficou {settings.staging_hold_hours}h pronto no staging"
+                  " sem o envio chegar a acontecer")
     else:
         motivo = (f"o artefato passou das {settings.staging_hold_hours}h de staging"
                   f" sem conseguir chegar em {faltando}")

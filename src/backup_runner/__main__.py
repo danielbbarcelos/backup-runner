@@ -439,12 +439,19 @@ def cmd_tick(args: argparse.Namespace) -> int:
 
 
 def cmd_worker(args: argparse.Namespace) -> int:
-    """Consome a fila. É isto que o supervisord mantém de pé."""
+    """Consome a fila. É isto que o systemd mantém de pé.
+
+    Sem `--raia`, um processo cuida das duas, cada uma na sua thread. É o
+    padrão porque é uma unidade de systemd só para manter de pé.
+    """
     from . import worker
 
     if args.uma_vez:
-        c.info("processando um item da fila, se houver")
-    return worker.run_forever(intervalo=args.intervalo, uma_vez=args.uma_vez)
+        c.info("drenando a fila: produzir e enviar são itens separados")
+    elif args.raia:
+        c.info(f"consumindo só a raia de {args.raia}")
+    return worker.run_forever(intervalo=args.intervalo, uma_vez=args.uma_vez,
+                              raia=args.raia)
 
 
 def cmd_install(args: argparse.Namespace) -> int:
@@ -793,9 +800,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     s = sub.add_parser("worker", help="consome a fila (o supervisord chama isto)")
     s.add_argument("--uma-vez", action="store_true", dest="uma_vez",
-                   help="processa um item e sai, em vez de ficar de pé")
+                   help="drena a fila e sai, em vez de ficar de pé")
     s.add_argument("--intervalo", type=float, default=5.0,
                    help="segundos entre consultas à fila")
+    s.add_argument("--raia", choices=["producao", "envio"], default=None,
+                   help="consome só uma raia, para quem quer um processo por raia")
     s.set_defaults(func=cmd_worker)
 
     s = sub.add_parser("install", help="instala o agendamento: cron e worker")

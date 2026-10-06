@@ -39,7 +39,7 @@ from .models import (
     StageRecord,
     StageState,
 )
-from .state import PartesDeEnvio, State
+from .state import RAIA_ENVIO, RAIA_PRODUCAO, RAIAS, PartesDeEnvio, State
 
 
 class Cancelado(Exception):
@@ -118,11 +118,80 @@ class Progresso:
 # Laço principal
 # ----------------------------------------------------------------------------
 
-def run_forever(*, intervalo: float = 5.0, uma_vez: bool = False) -> int:
-    """Pega da fila e executa, até ser interrompido.
+def processa_um(estado: State, kinds=None) -> Resultado | None:
+    """Pega um item da fila e executa. Devolve None se não havia nada.
 
-    O supervisord manda SIGTERM para parar. Aqui isso vira uma saída limpa
-    depois do job atual, e não um dump cortado no meio.
+    Encerrar o item da fila acontece aqui, no `finally`, e não depois de dar
+    certo: um item que explode e fica em 'running' bloquearia toda janela
+    futura do job, e foi esse o pior defeito que o estudo encontrou.
+    """
+    item = estado.claim_next(kinds)
+    if item is None:
+        return None
+    resultado = None
+    try:
+        resultado = executa_item(item, estado)
+        return resultado
+    finally:
+        estado.finish_queue_item(
+            item["id"], resultado.run.id if resultado and resultado.run else None
+        )
+
+
+def drena(estado: State, kinds=None, *, maximo: int = 100) -> list[Resultado]:
+    """Processa a fila até esvaziar, devolvendo o que aconteceu.
+
+    Serve ao `--uma-vez` e aos testes. Com produção e envio em itens separados,
+    um backup completo são dois itens, então processar "um item" deixou de ser
+    o mesmo que "rodar o job".
+    """
+    feitos: list[Resultado] = []
+    for _ in range(maximo):
+        r = processa_um(estado, kinds)
+        if r is None:
+            return feitos
+        feitos.append(r)
+    return feitos
+
+
+def _laco(raia: str, intervalo: float, parar: dict) -> None:
+    """Um laço de consumo, para uma raia só.
+
+    Cada laço tem o próprio `State`, porque a conexão do SQLite não atravessa
+    thread. O `BEGIN IMMEDIATE` do `claim_next` é o que torna seguro os dois
+    laços disputarem a mesma fila.
+    """
+    estado = State()
+    try:
+        while not parar["agora"]:
+            try:
+                if processa_um(estado, RAIAS[raia]) is None:
+                    time.sleep(intervalo)
+            except Exception as exc:  # noqa: BLE001
+                # Um job que explode de forma inesperada não pode derrubar a
+                # raia e deixar todos os outros sem worker.
+                print(f"[{raia}] erro inesperado: {type(exc).__name__}: {exc}",
+                      file=sys.stderr, flush=True)
+                time.sleep(intervalo)
+    finally:
+        estado.close()
+
+
+def run_forever(*, intervalo: float = 5.0, uma_vez: bool = False,
+                raia: str | None = None) -> int:
+    """Consome a fila até ser interrompido.
+
+    Duas raias, cada uma na sua thread: produção e envio. É isso que impede um
+    envio de quatro horas de atrasar o dump de trinta segundos de outro job.
+    Dentro de cada raia o trabalho continua serial, porque dois dumps pesados
+    disputando disco demoram mais que os dois em sequência, e dois envios
+    disputando a mesma rede não sobem mais rápido.
+
+    `raia` restringe a um laço só, para quem preferir uma unidade de systemd
+    por raia. Sem ela, um processo cuida das duas.
+
+    O SIGTERM vira saída limpa depois do item atual, e não dump cortado no
+    meio.
     """
     parar = {"agora": False}
 
@@ -132,22 +201,33 @@ def run_forever(*, intervalo: float = 5.0, uma_vez: bool = False) -> int:
     signal.signal(signal.SIGTERM, encerra)
     signal.signal(signal.SIGINT, encerra)
 
-    estado = State()
-    try:
-        while not parar["agora"]:
-            item = estado.claim_next()
-            if item is None:
-                if uma_vez:
-                    return 0
-                time.sleep(intervalo)
-                continue
+    if uma_vez:
+        # Um backup completo são dois itens agora, então "uma vez" é drenar o
+        # que está na fila, não processar um item.
+        estado = State()
+        try:
+            feitos = drena(estado, RAIAS[raia] if raia else None)
+        finally:
+            estado.close()
+        if not feitos:
+            return 0
+        return 0 if all(r.ok for r in feitos) else 1
 
-            resultado = executa_item(item, estado)
-            estado.finish_queue_item(item["id"], resultado.run.id if resultado.run else None)
-            if uma_vez:
-                return 0 if resultado.ok else 1
-    finally:
-        estado.close()
+    raias = [raia] if raia else list(RAIAS)
+    fios = [
+        threading.Thread(target=_laco, args=(r, intervalo, parar),
+                         name=f"raia-{r}", daemon=True)
+        for r in raias
+    ]
+    for f in fios:
+        f.start()
+    try:
+        while not parar["agora"] and any(f.is_alive() for f in fios):
+            time.sleep(0.2)
+    except KeyboardInterrupt:
+        parar["agora"] = True
+    for f in fios:
+        f.join(timeout=intervalo + 2)
     return 0
 
 
@@ -164,8 +244,8 @@ def executa_item(item: dict, estado: State) -> Resultado:
         estado.insert_run(run)
         return Resultado(run, False, "job inexistente")
 
-    if item.get("kind") == "upload_retry":
-        return reenvia_pendentes(job, estado)
+    if item.get("kind") in RAIA_ENVIO:
+        return envia_artefato(job, estado, item)
     return executa(job, estado, atrasado=bool(item.get("late")),
                    queue_id=item.get("id"))
 
@@ -205,7 +285,6 @@ def _executa_vigiado(
     try:
         _produz(job, run, pasta, limite, prog, sentinela)
         _escreve_manifest(run, pasta, sentinela)
-        _envia(job, run, pasta, estado, prog, sentinela)
     except Cancelado as exc:
         return _cancela(run, estado, pasta, str(exc))
     except mysql.MySQLError as exc:
@@ -219,22 +298,25 @@ def _executa_vigiado(
     except Exception as exc:  # noqa: BLE001 - o worker não pode morrer por um job
         return _falha(run, estado, Stage.UPLOAD, exc, job)
 
-    run.finished_at = dt.datetime.now()
-    run.duration = (run.finished_at - inicio).total_seconds()
-    run.result = RunResult.LATE if atrasado else RunResult.OK
-
-    if run.destinations_pending:
-        run.result = RunResult.PENDING_UPLOAD
-        run.retry_at = run.finished_at + dt.timedelta(hours=1)
-    else:
-        _retencao(job, run)
-        _limpa_staging(job, pasta, run)
-
-    prog.etapa("concluído", run.artifact or "")
-    run.log.append((run.finished_at.strftime("%H:%M:%S"), "ok", "execução concluída"))
+    # Artefato pronto. Daqui em diante é a raia de envio que trabalha, e é esta
+    # separação que impede um envio de quatro horas de atrasar o dump de trinta
+    # segundos de outro job.
+    #
+    # O estado é `QUEUED` e não `RUNNING` de propósito: no intervalo entre as
+    # duas fases não existe worker nenhum batendo o coração, e deixar `RUNNING`
+    # faria o detector de órfã matar uma execução perfeitamente sadia.
+    run.result = RunResult.QUEUED
+    prog.etapa("aguardando envio", run.artifact or "")
+    run.log.append((
+        dt.datetime.now().strftime("%H:%M:%S"), "worker",
+        "artefato pronto, esperando a raia de envio",
+    ))
     estado.update_run(run)
-    _avisa(job, run)
-    return Resultado(run, run.result in (RunResult.OK, RunResult.LATE))
+    # `due_at` é o início da execução, que é único por execução: usar o relógio
+    # de agora arriscaria colidir com a chave única da fila.
+    estado.enqueue(job.name, run.started_at, kind="envio", run_id=run.id,
+                   late=atrasado)
+    return Resultado(run, True, "artefato pronto, envio enfileirado")
 
 
 def _produz(job: Job, run: Run, pasta: Path, limite: dt.datetime, prog: Progresso,
@@ -655,81 +737,129 @@ def _envia(
     estado.update_run(run)
 
 
-def reenvia_pendentes(job: Job, estado: State) -> Resultado:
-    """Tenta de novo os destinos que faltaram, usando o artefato do staging.
+def envia_artefato(job: Job, estado: State, item: dict) -> Resultado:
+    """A raia de envio: pega o artefato do staging e manda para os destinos.
 
-    Não refaz o dump: o arquivo já existe, e refazer custaria uma leitura nova
-    do banco de produção por um problema que é de rede.
+    Serve aos dois casos, e de propósito. O primeiro envio de uma execução
+    chega aqui porque a produção enfileirou; o reenvio de uma execução pendente
+    chega porque o tick enfileirou. Os dois fazem a mesma coisa, e ter um único
+    caminho é o que garante que o reenvio não seja uma versão pior do envio, o
+    que era justamente o caso antes: o reenvio não reportava progresso nenhum.
+
+    Nunca refaz o dump. O arquivo já existe, e refazer custaria uma leitura
+    nova do banco de produção por um problema que é de rede.
     """
     if JobStore.load().get(job.name) is None:
-        # O tick enfileirou o reenvio, o job sumiu antes de ele ser atendido.
+        # O tick enfileirou, o job sumiu antes de o item ser atendido.
         return Resultado(
             Run(id=0, job=job.name, started_at=dt.datetime.now(),
                 finished_at=dt.datetime.now(), result=RunResult.OK),
-            True, "job apagado, reenvio descartado",
+            True, "job apagado, envio descartado",
         )
 
-    pendentes = [r for r in estado.pending_uploads() if r.job == job.name]
-    if not pendentes:
-        run = Run(id=0, job=job.name, started_at=dt.datetime.now(),
-                  finished_at=dt.datetime.now(), result=RunResult.OK,
-                  error_cause="nada pendente")
-        return Resultado(run, True, "nada a reenviar")
+    run = _execucao_do_item(estado, job, item)
+    if run is None:
+        return Resultado(
+            Run(id=0, job=job.name, started_at=dt.datetime.now(),
+                finished_at=dt.datetime.now(), result=RunResult.OK,
+                error_cause="nada a enviar"),
+            True, "nada a enviar",
+        )
 
-    run = pendentes[0]
     pasta = staging_dir() / job.name / run.folder
     if not pasta.is_dir():
         run.result = RunResult.FAILED
+        run.finished_at = run.finished_at or dt.datetime.now()
+        run.error_stage = Stage.UPLOAD
         run.error_cause = "o artefato não está mais no staging"
         run.error_fix = f"rode o job de novo: backup-runner run {job.name}"
         estado.update_run(run)
         return Resultado(run, False, "artefato sumiu")
 
-    faltando = list(run.destinations_pending)
+    primeira_vez = run.result is RunResult.QUEUED
+    if not primeira_vez:
+        run.retry_count += 1
+    run.result = RunResult.RUNNING
     run.destinations_pending = []
-    run.retry_count += 1
-    destinos = DestinationStore.load()
-    prefixo = f"{job.name}/{run.folder}"
-    a_enviar = sum(f.stat().st_size for f in pasta.iterdir() if f.is_file())
-    prog = Progresso(estado, run.id)
+    estado.update_run(run)
 
-    for nome in faltando:
-        destino = destinos.get(nome)
-        if destino is None:
-            run.destinations_pending.append(nome)
-            continue
-        prog.etapa("reenviando", f"{nome}: {destino.location()}", total=a_enviar)
-        try:
-            enviados = destinations.backend(destino).upload(
-                pasta, prefixo, on_progress=prog.anda,
-                # Mesmo registro da primeira tentativa: é por ele que as partes
-                # já no provedor são reaproveitadas em vez de reenviadas.
-                registro=PartesDeEnvio(estado, run.id),
-                on_phase=lambda fase: prog.etapa(fase, nome, total=a_enviar),
-            )
-        except Exception as exc:  # noqa: BLE001
-            run.destinations_pending.append(nome)
-            run.error_got = destinations._resumo_erro(exc)
-            continue
-        run.destinations_done.append(nome)
-        run.manifest.append(ManifestEntry(nome, _sha256(pasta / (run.artifact or "")), enviados))
-        run.stages.append(StageRecord(Stage.UPLOAD, StageState.DONE, nome, "reenviado", 0.0))
-        run.log.append((dt.datetime.now().strftime("%H:%M:%S"), nome, "reenviado"))
+    # O prazo continua sendo o do job inteiro, contado do início da execução, e
+    # não um prazo novo por fase: quem configurou 240 minutos quer que o backup
+    # todo caiba neles.
+    limite = run.started_at + dt.timedelta(minutes=job.timeout_minutes)
+    prog = Progresso(estado, run.id)
+    prog.etapa("preparando envio", job.name)
+
+    with Vigilancia(estado, run, job.name, limite, item.get("id")) as vigia:
+        return _envia_vigiado(
+            job, run, estado, pasta, prog, Sentinela(vigia),
+            atrasado=bool(item.get("late")), primeira_vez=primeira_vez,
+        )
+
+
+def _execucao_do_item(estado: State, job: Job, item: dict) -> Run | None:
+    """Qual execução este item de envio manda embora.
+
+    O item novo traz o `run_id`. O antigo, de banco gravado por versão
+    anterior, não traz, e aí a escolha é a execução pendente mais recente, que
+    é o que o reenvio sempre fez.
+    """
+    run_id = item.get("run_id")
+    if run_id:
+        run = estado.get_run(int(run_id))
+        if run is not None and run.result in (RunResult.QUEUED, RunResult.PENDING_UPLOAD):
+            return run
+        return None
+    pendentes = [r for r in estado.pending_uploads() if r.job == job.name]
+    return pendentes[0] if pendentes else None
+
+
+def _envia_vigiado(
+    job: Job, run: Run, estado: State, pasta: Path, prog: Progresso,
+    sentinela: Sentinela, *, atrasado: bool, primeira_vez: bool,
+) -> Resultado:
+    try:
+        _envia(job, run, pasta, estado, prog, sentinela)
+    except Cancelado as exc:
+        return _cancela(run, estado, pasta, str(exc))
+    except JobRemovido:
+        return _desiste(run, estado, pasta)
+    except TimeoutError as exc:
+        return _falha(run, estado, Stage.UPLOAD, exc, job)
+    except Exception as exc:  # noqa: BLE001 - o worker não pode morrer por um job
+        return _falha(run, estado, Stage.UPLOAD, exc, job)
+
+    run.finished_at = dt.datetime.now()
+    run.duration = (run.finished_at - run.started_at).total_seconds()
 
     if run.destinations_pending:
-        run.retry_at = dt.datetime.now() + dt.timedelta(hours=1)
+        run.result = RunResult.PENDING_UPLOAD
+        run.retry_at = run.finished_at + dt.timedelta(hours=1)
         estado.update_run(run)
-        _avisa(JobStore.load().get(job.name) or job, run)
+        _avisa(job, run)
         return Resultado(run, False, "ainda falta destino")
 
-    run.result = RunResult.OK
+    run.result = RunResult.LATE if atrasado else RunResult.OK
     run.error_stage = None
     run.error_got = run.error_cause = run.error_fix = ""
     _retencao(job, run)
     _limpa_staging(job, pasta, run)
+    prog.etapa("concluído", run.artifact or "")
+    run.log.append((run.finished_at.strftime("%H:%M:%S"), "ok", "execução concluída"))
     estado.update_run(run)
-    _avisa(job, run, recuperado=True)
-    return Resultado(run, True, "reenvio completo")
+    # "recuperado" só quando houve falha antes. No primeiro envio não há do que
+    # recuperar, e dizer que recuperou seria mentira.
+    _avisa(job, run, recuperado=not primeira_vez)
+    return Resultado(run, True, "envio completo")
+
+
+def reenvia_pendentes(job: Job, estado: State) -> Resultado:
+    """Reenvia a execução pendente mais recente deste job.
+
+    Mantido como atalho para o comando manual e para quem já chamava assim. O
+    trabalho é o mesmo da raia de envio, e de propósito: um único caminho.
+    """
+    return envia_artefato(job, estado, {"kind": "envio", "late": False})
 
 
 # ----------------------------------------------------------------------------
