@@ -366,7 +366,8 @@ def cmd_tick(args: argparse.Namespace) -> int:
 
     resultado = run_tick()
     if (args.verbose or resultado.enfileirados or resultado.perdidos
-            or resultado.reenvios or resultado.abandonadas):
+            or resultado.reenvios or resultado.abandonadas
+            or resultado.filas_soltas or resultado.desistencias):
         print(resultado.resumo())
         for nome, janela, atrasado in resultado.enfileirados:
             print(f"  fila     {nome}  janela {janela:%d/%m %H:%M}" + (" (atrasado)" if atrasado else ""))
@@ -376,6 +377,10 @@ def cmd_tick(args: argparse.Namespace) -> int:
             print(f"  reenvio  {nome}")
         for run_id, nome in resultado.abandonadas:
             print(f"  órfã     {nome}  execução #{run_id} sem worker, marcada como falha")
+        for fila_id, nome in resultado.filas_soltas:
+            print(f"  fila     {nome}  item #{fila_id} preso por worker morto, liberado")
+        for run_id, nome in resultado.desistencias:
+            print(f"  desiste  {nome}  execução #{run_id} não vai mais ser reenviada, staging liberado")
     return 0
 
 

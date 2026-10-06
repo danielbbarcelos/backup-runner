@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import os
 import sqlite3
 from pathlib import Path
 from typing import Any, Iterable
@@ -52,7 +53,11 @@ CREATE TABLE IF NOT EXISTS runs (
     prog_total    INTEGER NOT NULL DEFAULT 0,
     prog_label    TEXT,
     prog_pid      INTEGER,
-    heartbeat     TEXT
+    heartbeat     TEXT,
+    -- Pedido de cancelamento. É uma marca, não um sinal: quem cancela escreve
+    -- aqui e segue a vida, e o worker obedece quando passar pela sentinela.
+    -- Matar o processo deixaria staging sujo e linha de fila presa.
+    cancel_at     TEXT
 );
 CREATE INDEX IF NOT EXISTS runs_job_started ON runs(job, started_at DESC);
 CREATE INDEX IF NOT EXISTS runs_started ON runs(started_at DESC);
@@ -66,9 +71,33 @@ CREATE TABLE IF NOT EXISTS queue (
     late        INTEGER NOT NULL DEFAULT 0,
     kind        TEXT    NOT NULL DEFAULT 'full',
     run_id      INTEGER,
+    -- Quem pegou o item, e quando. Sem isto, uma linha em 'running' deixada
+    -- por worker morto é indistinguível de trabalho em andamento, e como
+    -- `ja_na_fila` olha 'running', ela descarta toda janela futura do job: a
+    -- ferramenta para de fazer backup e continua dizendo que está tudo bem.
+    claimed_pid  INTEGER,
+    claimed_at   TEXT,
     UNIQUE(job, due_at, kind)
 );
 CREATE INDEX IF NOT EXISTS queue_status ON queue(status, due_at);
+
+-- Envio em partes, para retomar de onde parou em vez de recomeçar do zero.
+-- O `upload_id` é o estado que precisa sobreviver ao processo morrer: sem ele,
+-- as partes já no provedor são inalcançáveis e só restaria reenviar tudo.
+-- Cada parte concluída vira uma linha, e parte registrada é parte que não
+-- se reenvia.
+CREATE TABLE IF NOT EXISTS upload_parts (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id      INTEGER NOT NULL,
+    destino     TEXT    NOT NULL,
+    chave       TEXT    NOT NULL,
+    upload_id   TEXT    NOT NULL,
+    part_number INTEGER NOT NULL,
+    etag        TEXT,
+    bytes       INTEGER NOT NULL DEFAULT 0,
+    UNIQUE(run_id, destino, chave, part_number)
+);
+CREATE INDEX IF NOT EXISTS partes_envio ON upload_parts(run_id, destino, chave);
 """
 
 ISO = "%Y-%m-%dT%H:%M:%S"
@@ -101,24 +130,35 @@ class State:
     def _migra(self) -> None:
         """Acrescenta colunas que versões novas passaram a usar.
 
-        Um banco criado por versão anterior não tem as colunas de progresso, e
+        Um banco criado por versão anterior não tem as colunas novas, e
         `CREATE TABLE IF NOT EXISTS` não as adiciona. Sem isto, atualizar o
         programa quebraria a leitura do histórico que já existe.
         """
-        existentes = {
-            linha["name"] for linha in self.conn.execute("PRAGMA table_info(runs)")
-        }
         novas = {
-            "prog_stage": "TEXT",
-            "prog_done": "INTEGER NOT NULL DEFAULT 0",
-            "prog_total": "INTEGER NOT NULL DEFAULT 0",
-            "prog_label": "TEXT",
-            "prog_pid": "INTEGER",
-            "heartbeat": "TEXT",
+            "runs": {
+                "prog_stage": "TEXT",
+                "prog_done": "INTEGER NOT NULL DEFAULT 0",
+                "prog_total": "INTEGER NOT NULL DEFAULT 0",
+                "prog_label": "TEXT",
+                "prog_pid": "INTEGER",
+                "heartbeat": "TEXT",
+                "cancel_at": "TEXT",
+            },
+            "queue": {
+                "claimed_pid": "INTEGER",
+                "claimed_at": "TEXT",
+            },
         }
-        for coluna, tipo in novas.items():
-            if coluna not in existentes:
-                self.conn.execute(f"ALTER TABLE runs ADD COLUMN {coluna} {tipo}")
+        for tabela, colunas in novas.items():
+            existentes = {
+                linha["name"]
+                for linha in self.conn.execute(f"PRAGMA table_info({tabela})")
+            }
+            for coluna, tipo in colunas.items():
+                if coluna not in existentes:
+                    self.conn.execute(
+                        f"ALTER TABLE {tabela} ADD COLUMN {coluna} {tipo}"
+                    )
 
     def close(self) -> None:
         self.conn.close()
@@ -164,7 +204,12 @@ class State:
             if linha is None:
                 self.conn.execute("COMMIT")
                 return None
-            self.conn.execute("UPDATE queue SET status='running' WHERE id=?", (linha["id"],))
+            # Quem pegou e quando. É o que permite distinguir depois trabalho
+            # em andamento de rastro de worker morto.
+            self.conn.execute(
+                "UPDATE queue SET status='running', claimed_pid=?, claimed_at=? WHERE id=?",
+                (os.getpid(), _fmt(dt.datetime.now()), linha["id"]),
+            )
             self.conn.execute("COMMIT")
             return dict(linha)
         except Exception:
@@ -181,6 +226,34 @@ class State:
             "SELECT * FROM queue WHERE status IN ('pending','running') ORDER BY due_at"
         ).fetchall()
         return [dict(l) for l in linhas]
+
+    def filas_presas(self) -> list[dict[str, Any]]:
+        """Itens em 'running' cujo processo não existe mais.
+
+        São o rastro de um worker que morreu entre o `claim_next` e o
+        `finish_queue_item`. Enquanto a linha fica, `ja_na_fila` dá verdadeiro e
+        o tick descarta toda janela futura daquele job, em silêncio, porque
+        `queue_size` conta só 'pending' e o `status` segue dizendo "fila vazia".
+
+        Decidir pelo pid, e não pela idade, é deliberado: um envio legítimo de
+        seis horas tem claim antigo e está vivo, e roubar o item dele colocaria
+        dois workers no mesmo backup.
+        """
+        linhas = self.conn.execute(
+            "SELECT * FROM queue WHERE status='running' ORDER BY id"
+        ).fetchall()
+        return [dict(l) for l in linhas]
+
+    def solta_fila(self, queue_id: int) -> None:
+        """Marca o item como encerrado sem sucesso, liberando a janela.
+
+        Não volta para 'pending': refazer sozinho um backup cujo worker morreu
+        pode repetir trabalho caro sem ninguém pedir. A janela seguinte entra
+        normalmente, e o tick registra a perdida se for o caso.
+        """
+        self.conn.execute(
+            "UPDATE queue SET status='abandoned' WHERE id=?", (queue_id,)
+        )
 
     def queue_size(self) -> int:
         linha = self.conn.execute(

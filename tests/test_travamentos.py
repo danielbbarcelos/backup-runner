@@ -1,10 +1,10 @@
-"""Defeitos conhecidos e ainda não corrigidos, do estudo de 2026-10-06.
+"""Os travamentos do estudo de 2026-10-06, agora corrigidos.
 
-Estes testes descrevem comportamento que o programa **deveria** ter e hoje não
-tem. Ficam marcados como `xfail(strict=True)`, o que significa duas coisas: a
-suíte continua verde enquanto o defeito existe, e no dia em que alguém
-corrigir, o teste passa a falhar por "passou inesperadamente" e obriga a tirar
-a marca. É a forma de um defeito conhecido não virar defeito esquecido.
+Nasceram como `xfail(strict=True)`, descrevendo comportamento que o programa
+deveria ter e não tinha. A marca estrita é o que tornou a correção visível: ao
+passar, o teste falha por "passou inesperadamente" e obriga a tirar a marca, em
+vez de deixar um defeito conhecido virar defeito esquecido. Os dois passaram, as
+marcas saíram, e agora eles guardam a correção contra regressão.
 
 O estudo completo, com a causa comum e a ordem de correção proposta, está em
 `Projetos/labs/[2026-09-14] Backup Runner — backup agendado de bancos e arquivos.md`,
@@ -38,7 +38,6 @@ def job_noturno(nome="noturno") -> Job:
     return job
 
 
-@pytest.mark.xfail(strict=True, reason="defeito 1 do estudo: linha de fila presa mata o job")
 def test_fila_presa_em_running_nao_pode_matar_o_job():
     """Worker morto depois do claim deixa a fila em 'running' para sempre.
 
@@ -56,7 +55,10 @@ def test_fila_presa_em_running_nao_pode_matar_o_job():
     # O worker reivindicou e morreu: fila em 'running', execução em 'running'
     # com pid que não existe mais.
     estado.enqueue("noturno", dt.datetime(2026, 10, 1, 3, 0))
-    estado.claim_next()
+    item = estado.claim_next()
+    # O claim grava o pid de quem pegou. Aqui o worker morreu, então o pid
+    # registrado tem que ser um que não existe mais.
+    estado.conn.execute("UPDATE queue SET claimed_pid=999999 WHERE id=?", (item["id"],))
     run = Run(id=0, job="noturno", started_at=dt.datetime(2026, 10, 1, 3, 0),
               result=RunResult.RUNNING)
     estado.insert_run(run)
@@ -64,17 +66,20 @@ def test_fila_presa_em_running_nao_pode_matar_o_job():
     estado.conn.execute("UPDATE runs SET heartbeat=? WHERE id=?",
                         (_fmt(dt.datetime(2026, 10, 1, 3, 5)), run.id))
 
-    # Cinco dias depois, o tick tem que voltar a enfileirar as 3h.
-    enfileirados = 0
-    for dia in (6, 7, 8, 9):
-        r = run_tick(dt.datetime(2026, 10, dia, 9, 0), state=estado)
-        enfileirados += len(r.enfileirados)
+    # Dias depois, às 3h30: dentro da tolerância de 120 min da janela das 3h,
+    # então o certo é a janela entrar na fila.
+    r = run_tick(dt.datetime(2026, 10, 6, 3, 30), state=estado)
+    status = {x["id"]: x["status"] for x in estado.conn.execute("SELECT id, status FROM queue")}
     estado.close()
 
-    assert enfileirados > 0, "o job parou de ser feito e nada avisou"
+    assert r.enfileirados, "a janela não voltou para a fila: o job está morto"
+    assert (item["id"], "noturno") in r.filas_soltas
+    assert status[item["id"]] == "abandoned", "a linha presa continua bloqueando"
+    # A órfã de `runs` também é fechada: são dois registros do mesmo fato, e
+    # consertar só um deixava o job travado assim mesmo.
+    assert r.abandonadas == [(run.id, "noturno")]
 
 
-@pytest.mark.xfail(strict=True, reason="defeito 2 do estudo: pendente sem estado terminal")
 def test_pendente_que_esgota_tentativas_vira_falha_e_libera_disco():
     """Todo estado de espera precisa de prazo para um estado terminal.
 

@@ -22,6 +22,10 @@ from .models import Job, Run, RunResult, Stage
 from .schedule import Cron, CronError
 from .state import State
 
+# Três tentativas de envio. Além disso é insistência: se três falharam, o
+# problema não é o soluço de rede que a retentativa resolve.
+MAX_REENVIOS = 3
+
 
 @dataclass
 class TickResult:
@@ -30,6 +34,8 @@ class TickResult:
     reenvios: list[str]
     pulados: list[str]
     abandonadas: list[tuple[int, str]] = field(default_factory=list)
+    filas_soltas: list[tuple[int, str]] = field(default_factory=list)
+    desistencias: list[tuple[int, str]] = field(default_factory=list)
 
     def resumo(self) -> str:
         partes = []
@@ -41,6 +47,10 @@ class TickResult:
             partes.append(f"{len(self.reenvios)} reenvios")
         if self.abandonadas:
             partes.append(f"{len(self.abandonadas)} abandonadas")
+        if self.filas_soltas:
+            partes.append(f"{len(self.filas_soltas)} filas presas soltas")
+        if self.desistencias:
+            partes.append(f"{len(self.desistencias)} pendentes encerradas")
         return ", ".join(partes) or "nada a fazer"
 
 
@@ -52,6 +62,9 @@ def run_tick(agora: dt.datetime | None = None, *, state: State | None = None) ->
     resultado = TickResult([], [], [], [])
 
     try:
+        # A ordem importa: soltar a fila presa antes de avaliar os jobs, senão
+        # a linha fantasma ainda faz `ja_na_fila` descartar a janela deste tick.
+        _solta_filas_presas(estado, resultado)
         _fecha_orfas(estado, resultado)
         for job in jobs.list():
             if not job.enabled:
@@ -63,6 +76,27 @@ def run_tick(agora: dt.datetime | None = None, *, state: State | None = None) ->
         if state is None:
             estado.close()
     return resultado
+
+
+def _solta_filas_presas(estado: State, resultado: TickResult) -> None:
+    """Libera itens de fila cujo worker morreu sem encerrar o item.
+
+    Este é o defeito que fazia a ferramenta parar de tirar backup e continuar
+    dizendo que estava tudo bem. A linha em 'running' bloqueava toda janela
+    futura, não aparecia no `queue_size` e nem gerava aviso de janela perdida,
+    porque o bloqueio acontecia antes dessa lógica.
+
+    Critério é o pid, não a idade. Um envio legítimo de seis horas tem claim
+    antigo e processo vivo, e tomar o item dele poria dois workers no mesmo
+    backup, que é um problema pior que o original.
+    """
+    from .service import pid_vivo
+
+    for item in estado.filas_presas():
+        if pid_vivo(item.get("claimed_pid")):
+            continue
+        estado.solta_fila(item["id"])
+        resultado.filas_soltas.append((item["id"], item["job"]))
 
 
 def _fecha_orfas(estado: State, resultado: TickResult) -> None:
@@ -93,6 +127,12 @@ def _fecha_orfas(estado: State, resultado: TickResult) -> None:
             "execução sem sinal de vida, marcada como falha",
         ))
         estado.update_run(run)
+        # Dois registros do mesmo fato. Consertar só o de `runs`, como a v0.6.0
+        # fazia, deixava a linha de fila presa e o job morto assim mesmo.
+        for item in estado.filas_presas():
+            if item["job"] == run.job and not pid_vivo(item.get("claimed_pid")):
+                estado.solta_fila(item["id"])
+                resultado.filas_soltas.append((item["id"], item["job"]))
         resultado.abandonadas.append((run.id, run.job))
 
 
@@ -154,12 +194,62 @@ def _reenvios_pendentes(agora: dt.datetime, settings: Settings, estado: State, r
     nova leitura do banco de produção por um problema que é de rede.
     """
     for run in estado.pending_uploads():
-        if run.retry_at is None or run.retry_at > agora:
-            continue
-        if run.retry_count >= 3:
-            continue
+        # Toda espera precisa de prazo para um estado terminal. Sem isto a
+        # execução ficava em 'pending' indefinidamente: sem reenvio, sem virar
+        # falha, sem aviso, e com o artefato ocupando disco para sempre. A doze
+        # gigabytes por ocorrência, enche disco calado.
         limite = run.started_at + dt.timedelta(hours=settings.staging_hold_hours)
-        if agora > limite:
+        if agora > limite or run.retry_count >= MAX_REENVIOS:
+            _desiste_do_pendente(run, estado, resultado, agora, settings)
+            continue
+        if run.retry_at is None or run.retry_at > agora:
             continue
         if estado.enqueue(run.job, agora, kind="upload_retry") is not None:
             resultado.reenvios.append(run.job)
+
+
+def _desiste_do_pendente(
+    run: Run, estado: State, resultado: TickResult,
+    agora: dt.datetime, settings: Settings,
+) -> None:
+    """Encerra de vez uma execução que não vai mais ser reenviada.
+
+    Vira falha com causa explícita, avisa uma vez e libera o staging. Avisar é
+    o ponto: até aqui a desistência era muda, e um backup que nunca chegou ao
+    destino ficava parecendo pendente para sempre.
+    """
+    import shutil
+
+    from .config import JobStore, staging_dir
+
+    faltando = ", ".join(run.destinations_pending) or "o destino"
+    if run.retry_count >= MAX_REENVIOS:
+        motivo = f"{run.retry_count} tentativas de envio para {faltando}, todas falharam"
+    else:
+        motivo = (f"o artefato passou das {settings.staging_hold_hours}h de staging"
+                  f" sem conseguir chegar em {faltando}")
+
+    run.result = RunResult.FAILED
+    run.finished_at = run.finished_at or agora
+    run.error_stage = Stage.UPLOAD
+    run.error_cause = motivo
+    run.error_fix = f"resolva o destino e rode de novo: backup-runner run {run.job}"
+    run.log.append((agora.strftime("%H:%M:%S"), "tick", "envio abandonado, staging liberado"))
+
+    pasta = staging_dir() / run.job / run.folder
+    shutil.rmtree(pasta, ignore_errors=True)
+    raiz = pasta.parent
+    try:
+        if raiz.is_dir() and not any(raiz.iterdir()):
+            raiz.rmdir()
+    except OSError:
+        pass
+
+    estado.update_run(run)
+    resultado.desistencias.append((run.id, run.job))
+
+    job = JobStore.load().get(run.job)
+    if job is not None:
+        from .worker import _avisa
+
+        _avisa(job, run)
