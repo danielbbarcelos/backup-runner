@@ -185,6 +185,20 @@ artefato no disco para sempre. Agora vira falha com causa explícita, avisa uma
 vez e libera o staging. O tick também varre staging de execução que já terminou,
 nunca tocando em execução viva nem em envio pendente.
 
+### Tabelas ignoradas
+
+Tabela ignorada sai no dump só com a estrutura, sem os dados. O padrão de um
+job novo ignora:
+
+- tabelas mensais, que terminam em `_YYYYMM` (com ou sem sufixo `_v2`);
+- as do Laravel Telescope (`telescope_*`) e do Laravel Pulse (`pulse_*`), dados
+  de depuração e métrica que crescem muito e nunca são restaurados.
+
+A regex é reavaliada a cada execução, então tabela nova que casa já nasce
+ignorada. Job ainda com o padrão de fábrica de uma versão anterior passa para o
+atual sozinho; regex personalizada fica como está. Marcar à mão vale nos dois
+sentidos: acrescenta uma tabela ou resgata uma que a regex pegaria.
+
 ### Compressão
 
 Sempre, e em fluxo. O `mysqldump` escreve direto no gzip, então o SQL cru nunca

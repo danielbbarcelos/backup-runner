@@ -89,12 +89,30 @@ CHANNELS = [Channel.EMAIL, Channel.SLACK]
 # Padrão herdado do mysql-dumper: tabelas que terminam em _YYYYMM, com ou sem
 # sufixo de versão. Reavaliado a cada execução, então tabela mensal nova já
 # nasce ignorada.
-DEFAULT_IGNORE_REGEX = r"_[0-9]{6}$|_(19|20)[0-9]{2}(0[1-9]|1[0-2])(_v[0-9]+)?$"
+#
+# Também nascem ignoradas as tabelas do Laravel Telescope e do Laravel Pulse:
+# são dados de depuração e métrica, que crescem muito (13 GB no banco de logs
+# da Peer Saúde) e nunca são restaurados. A estrutura delas continua no dump.
+DEFAULT_IGNORE_REGEX = (
+    r"_[0-9]{6}$|_(19|20)[0-9]{2}(0[1-9]|1[0-2])(_v[0-9]+)?$"
+    r"|^telescope_|^pulse_"
+)
+
+# Padrões de fábrica de versões anteriores. Um job gravado com um deles nunca
+# foi personalizado, então ganha o padrão atual ao ser lido; job com regex
+# própria fica como está.
+LEGACY_IGNORE_REGEXES = {
+    r"_[0-9]{6}$|_(19|20)[0-9]{2}(0[1-9]|1[0-2])(_v[0-9]+)?$",
+}
 
 
 # ----------------------------------------------------------------------------
 # Fontes
 # ----------------------------------------------------------------------------
+
+def _atualiza_regex(regex: str) -> str:
+    return DEFAULT_IGNORE_REGEX if regex in LEGACY_IGNORE_REGEXES else regex
+
 
 @dataclass
 class MySQLSource:
@@ -156,7 +174,7 @@ class MySQLSource:
             user=d.get("user", ""),
             password_enc=d.get("password_enc"),
             database=d.get("database", ""),
-            ignore_regex=d.get("ignore_regex", DEFAULT_IGNORE_REGEX),
+            ignore_regex=_atualiza_regex(d.get("ignore_regex", DEFAULT_IGNORE_REGEX)),
             ignore_manual=list(d.get("ignore_manual") or []),
             keep_manual=list(d.get("keep_manual") or []),
         )
