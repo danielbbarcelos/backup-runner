@@ -206,9 +206,13 @@ def _cartao(evento: NotifyEvent, job: str, campos: list[tuple[str, str]], *,
             rodape_extra: str | None = None) -> dict:
     icone, cor, titulo_padrao = ESTILO[evento]
     titulo = titulo or titulo_padrao
-    blocos: list[dict] = [
+    # O título vai em `blocks`, fora da barra colorida. Com `blocks` presente o
+    # Slack usa o `text` só na notificação; sem ele, mostra o `text` e o título
+    # do cartão um embaixo do outro.
+    cabecalho = [
         {"type": "section", "text": {"type": "mrkdwn", "text": f"{icone} *{titulo}*  ·  *{_esc(job)}*"}},
     ]
+    blocos: list[dict] = []
     visiveis = [(r, v) for r, v in campos if v][:10]   # o Slack aceita dez campos por seção
     if visiveis:
         blocos.append({
@@ -224,6 +228,7 @@ def _cartao(evento: NotifyEvent, job: str, campos: list[tuple[str, str]], *,
     return {
         # `text` é o que aparece na notificação e em cliente sem suporte a blocos.
         "text": f"{icone} {titulo}: {job}",
+        "blocks": cabecalho,
         "attachments": [{"color": cor, "blocks": blocos}],
     }
 

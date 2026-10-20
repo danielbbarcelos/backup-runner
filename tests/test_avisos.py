@@ -145,8 +145,20 @@ def test_texto_do_erro_nao_vira_marcacao_do_slack(slack):
     assert "&lt;Error&gt; &amp; &lt;Code&gt;" in _texto(slack[0])
 
 
+def test_titulo_aparece_uma_vez_so(slack):
+    """Sem `blocks` no topo, o Slack mostra o `text` e o título do cartão duplicados."""
+    from backup_runner import notify
+    from backup_runner.models import NotifyEvent
+
+    _liga(NotifyEvent.SUCCESS)
+    notify.sobre_execucao(_job(), _run())
+    payload = slack[0]
+    assert "Backup concluído" in payload["blocks"][0]["text"]["text"]
+    assert "Backup concluído" not in json.dumps(payload["attachments"], ensure_ascii=False)
+
+
 def test_aviso_de_teste_tambem_sai_como_cartao(slack):
     from backup_runner import notify
 
     assert notify.teste("slack").ok
-    assert slack[0]["attachments"][0]["blocks"]
+    assert slack[0]["blocks"] and slack[0]["attachments"][0]["blocks"]
