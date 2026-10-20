@@ -204,7 +204,7 @@ execução, nunca do mtime, porque copiar arquivo mexe no mtime. O arquivo local
 destinos escolhidos.
 
 ```
-peer-db/2026-09-14_03-00-00/
+peer-db/2026-09-14_03-00-00-0300/
   dump_peer_saude_app.sql.gz
   mysqldump.log
   manifest.json
@@ -212,7 +212,31 @@ peer-db/2026-09-14_03-00-00/
 
 Sem espaço e sem dois-pontos no caminho: espaço vira `%20` em chave S3 e
 dois-pontos quebram `scp` e `rsync`, que leem `host:caminho`. A ordenação
-alfabética coincide com a cronológica.
+alfabética coincide com a cronológica. O sufixo (`-0300`) é o deslocamento do
+relógio do programa, para a pasta dizer sozinha de que fuso veio. Pastas antigas,
+sem sufixo, continuam sendo lidas.
+
+### Fuso
+
+Servidor costuma rodar em UTC, e quem lê o histórico pensa na hora local. Por
+isso o programa tem relógio próprio: `timezone` em `settings.json`, padrão
+`America/Sao_Paulo`. É nele que ficam o histórico, a fila e o nome das pastas,
+qualquer que seja o fuso do servidor. Vazio usa o relógio do servidor.
+
+Cada job tem também o seu `timezone`, e é nele que o cron é lido: `0 3 * * *`
+num job em `America/Sao_Paulo` roda às 03:00 de Brasília mesmo com o servidor
+em UTC.
+
+### Avisos
+
+A matriz decide, por evento e por canal, o que avisa. O padrão de fábrica é
+silêncio significa sucesso: início e sucesso não avisam; falha, recuperação,
+janela perdida e silêncio longo avisam.
+
+No Slack cada aviso é um cartão com ícone e cor por evento (▶️ início, ✅
+sucesso, 🚨 falha, ⚠️ janela perdida, ⏰ silêncio longo), os campos da execução
+(origem, início com fuso, duração, tamanho, destinos, pasta) e, na falha, o que
+tentou, o que recebeu, a causa provável e como consertar.
 
 ## Instalação
 

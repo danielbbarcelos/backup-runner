@@ -233,6 +233,111 @@ def test_tick_nao_repete_janela_ja_executada():
     estado.close()
 
 
+def _relogio_do_programa(fuso: str) -> None:
+    from backup_runner.config import Settings
+
+    s = Settings.load()
+    s.timezone = fuso
+    s.save()
+
+
+def test_tick_le_o_cron_no_fuso_do_job():
+    """Programa em UTC e job em São Paulo: 03:00 do job é 06:00 do programa.
+
+    Foi o que aconteceu na Sul Minas: o campo `timezone` era ignorado e o
+    backup das três da manhã rodava à meia-noite de Brasília.
+    """
+    from backup_runner.config import JobStore
+    from backup_runner.state import State
+    from backup_runner.tick import run_tick
+
+    _relogio_do_programa("UTC")
+    store = JobStore()
+    store.jobs["loja"] = _job("loja", timezone="America/Sao_Paulo")
+    store.save()
+
+    estado = State()
+    # 03:01 UTC é 00:01 em São Paulo: a janela das 03:00 de hoje ainda não chegou
+    # e a de ontem já passou das seis horas de tolerância.
+    resultado = run_tick(dt.datetime(2026, 10, 20, 3, 1), state=estado)
+    assert resultado.enfileirados == []
+
+    resultado = run_tick(dt.datetime(2026, 10, 20, 6, 1), state=estado)
+    assert [(nome, janela) for nome, janela, _ in resultado.enfileirados] == [
+        ("loja", dt.datetime(2026, 10, 20, 6, 0)),
+    ]
+    estado.close()
+
+
+def test_tick_job_sem_fuso_ou_com_fuso_invalido_segue_o_programa():
+    from backup_runner.config import JobStore
+    from backup_runner.state import State
+    from backup_runner.tick import run_tick
+
+    _relogio_do_programa("UTC")
+    store = JobStore()
+    store.jobs["vazio"] = _job("vazio", timezone="")
+    store.jobs["errado"] = _job("errado", timezone="America/Nao_Existe")
+    store.save()
+
+    estado = State()
+    resultado = run_tick(dt.datetime(2026, 10, 20, 3, 1), state=estado)
+    assert sorted(nome for nome, _, _ in resultado.enfileirados) == ["errado", "vazio"]
+    estado.close()
+
+
+def test_proxima_execucao_respeita_o_fuso():
+    from backup_runner.schedule import next_run, previous_run
+
+    _relogio_do_programa("UTC")
+    agora = dt.datetime(2026, 10, 20, 12, 0)
+    assert next_run("0 3 * * *", agora, tz="America/Sao_Paulo") == dt.datetime(2026, 10, 21, 6, 0)
+    assert previous_run("0 3 * * *", agora, tz="America/Sao_Paulo") == dt.datetime(2026, 10, 20, 6, 0)
+    assert next_run("0 3 * * *", agora) == dt.datetime(2026, 10, 21, 3, 0)
+
+
+def test_relogio_do_programa_ignora_o_fuso_do_servidor(relogio_do_servidor):
+    """Servidor em UTC, programa em São Paulo: a hora do histórico é a de Brasília."""
+    from backup_runner import relogio
+
+    relogio_do_servidor("UTC")
+    _relogio_do_programa("America/Sao_Paulo")
+    diferenca = dt.datetime.now(dt.timezone.utc).replace(tzinfo=None) - relogio.agora()
+    assert abs(diferenca - dt.timedelta(hours=3)) < dt.timedelta(minutes=1)
+
+
+def test_relogio_vazio_usa_o_do_servidor(relogio_do_servidor):
+    from backup_runner import relogio
+
+    relogio_do_servidor("UTC")
+    _relogio_do_programa("")
+    assert abs(dt.datetime.now(dt.timezone.utc).replace(tzinfo=None) - relogio.agora()) < dt.timedelta(minutes=1)
+
+
+def test_pasta_leva_o_deslocamento_e_volta_igual():
+    from backup_runner import relogio
+
+    _relogio_do_programa("America/Sao_Paulo")
+    inicio = dt.datetime(2026, 10, 20, 3, 0, 5)
+    assert relogio.nome_pasta(inicio) == "2026-10-20_03-00-05-0300"
+    assert relogio.parse_pasta("2026-10-20_03-00-05-0300") == inicio
+
+
+def test_pasta_de_outro_relogio_e_convertida():
+    """Pasta gravada em UTC é lida na hora de Brasília, então a retenção conta certo."""
+    from backup_runner import relogio
+
+    _relogio_do_programa("America/Sao_Paulo")
+    assert relogio.parse_pasta("2026-10-20_06-00-05+0000") == dt.datetime(2026, 10, 20, 3, 0, 5)
+
+
+def test_pasta_antiga_sem_deslocamento_ainda_e_lida():
+    from backup_runner import relogio
+
+    assert relogio.parse_pasta("2026-10-20_03-00-05") == dt.datetime(2026, 10, 20, 3, 0, 5)
+    assert relogio.parse_pasta("staging") is None
+
+
 # ----------------------------------------------------------------------------
 # Segredos
 # ----------------------------------------------------------------------------
@@ -277,7 +382,7 @@ def test_pasta_da_execucao_nao_tem_espaco_nem_dois_pontos():
     from backup_runner.models import Run, RunResult
 
     run = Run(id=1, job="loja", started_at=dt.datetime(2026, 9, 14, 3, 0, 0), result=RunResult.OK)
-    assert run.folder == "2026-09-14_03-00-00"
+    assert run.folder == "2026-09-14_03-00-00-0300"
     assert " " not in run.folder and ":" not in run.folder
 
 

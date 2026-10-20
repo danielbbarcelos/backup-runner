@@ -21,6 +21,7 @@ from .config import JobStore, Settings
 from .models import Job, Run, RunResult, Stage
 from .schedule import Cron, CronError
 from .state import State
+from . import relogio
 
 # Três tentativas de envio. Além disso é insistência: se três falharam, o
 # problema não é o soluço de rede que a retentativa resolve.
@@ -58,7 +59,7 @@ class TickResult:
 
 
 def run_tick(agora: dt.datetime | None = None, *, state: State | None = None) -> TickResult:
-    agora = (agora or dt.datetime.now()).replace(second=0, microsecond=0)
+    agora = (agora or relogio.agora()).replace(second=0, microsecond=0)
     jobs = JobStore.load()
     settings = Settings.load()
     estado = state or State()
@@ -141,9 +142,8 @@ def _varre_staging(
 
     for pasta_job in sorted(p for p in raiz.iterdir() if p.is_dir()):
         for pasta in sorted(p for p in pasta_job.iterdir() if p.is_dir()):
-            try:
-                quando = dt.datetime.strptime(pasta.name, "%Y-%m-%d_%H-%M-%S")
-            except ValueError:
+            quando = relogio.parse_pasta(pasta.name)
+            if quando is None:
                 continue          # pasta que não é de execução, não é nossa
             if agora - quando <= corte:
                 continue
@@ -199,7 +199,7 @@ def _fecha_orfas(estado: State, resultado: TickResult) -> None:
         if pid_vivo(pid):
             continue
         run.result = RunResult.FAILED
-        run.finished_at = dt.datetime.now()
+        run.finished_at = relogio.agora()
         run.error_stage = run.error_stage or Stage.DUMP
         run.error_cause = f"o worker (pid {pid or '?'}) morreu no meio da execução"
         run.error_fix = "veja os logs do worker e rode de novo: backup-runner run " + run.job
@@ -223,9 +223,12 @@ def _avaliar(job: Job, agora: dt.datetime, estado: State, resultado: TickResult)
     except CronError:
         return
 
-    janela = cron.prev_before(agora)
+    # O cron é lido no fuso do job e a janela volta para o relógio do programa,
+    # que é o relógio da fila e do histórico.
+    janela = cron.prev_before(relogio.para_fuso(agora, job.timezone))
     if janela is None:
         return
+    janela = relogio.do_fuso(janela, job.timezone)
 
     ultima = estado.last_run(job.name)
     # Uma janela já atendida não volta: o corte é o início da última execução.

@@ -6,7 +6,6 @@ deixa metade de um job no disco.
 """
 from __future__ import annotations
 
-import datetime as dt
 import shutil
 from pathlib import Path
 
@@ -27,6 +26,7 @@ from .models import (
     SourceKind,
 )
 from .schedule import humanize, is_valid, next_run
+from . import relogio
 
 AGENDAS = [
     ("0 3 * * *", "todo dia às 03:00"),
@@ -69,7 +69,7 @@ def novo_job(ctx: Context) -> Job | None:
 def job_mysql(ctx: Context, job: Job | None = None) -> Job | None:
     editando = job is not None
     fonte: MySQLSource = job.source if editando else MySQLSource()  # type: ignore[assignment]
-    job = job or Job(name="", source=fonte, created=dt.date.today().isoformat())
+    job = job or Job(name="", source=fonte, created=relogio.agora().date().isoformat())
 
     c.titulo("conexão" if not editando else f"editando {job.name}")
     job.name = prompt.texto(
@@ -171,7 +171,7 @@ def _escolhe_tabelas(fonte: MySQLSource, tabelas: list) -> None:
 def job_arquivos(ctx: Context, job: Job | None = None) -> Job | None:
     editando = job is not None
     fonte: FilesSource = job.source if editando else FilesSource()  # type: ignore[assignment]
-    job = job or Job(name="", source=fonte, created=dt.date.today().isoformat())
+    job = job or Job(name="", source=fonte, created=relogio.agora().date().isoformat())
 
     c.titulo("origem" if not editando else f"editando {job.name}")
     job.name = prompt.texto(
@@ -269,9 +269,9 @@ def _agenda(job: Job) -> None:
     else:
         job.schedule = escolha
 
-    proxima = next_run(job.schedule)
+    proxima = next_run(job.schedule, tz=job.timezone)
     if proxima:
-        falta = (proxima - dt.datetime.now()).total_seconds()
+        falta = (proxima - relogio.agora()).total_seconds()
         c.sucesso(f"{humanize(job.schedule)}, próxima em {format_relative(falta)}")
 
     if prompt.confirma("ajustar tolerância e tempo limite", padrao=False):
@@ -430,35 +430,24 @@ def novo_destino(ctx: Context, destino: Destination | None = None) -> Destinatio
 
 
 def testa_destino(destino: Destination) -> bool:
-    """Escreve e apaga uma sonda. S3 e SFTP entram junto com o worker."""
-    if destino.kind is not DestKind.LOCAL:
-        c.aviso(f"o teste de {destino.kind.value} entra junto com o worker")
-        c.linha("o que tentei", f"conectar em {destino.location()}", largura_rotulo=16)
-        c.linha("causa provável", "a camada de envio ainda não foi implementada", largura_rotulo=16)
-        return False
+    """Grava e apaga uma sonda no destino, pelo mesmo backend que o worker usa."""
+    from .destinations import backend
 
-    caminho = Path(destino.path).expanduser()
-    try:
-        if not caminho.exists():
-            if not destino.create_missing:
-                c.erro("o diretório não existe e 'criar se faltar' está desligado")
-                c.linha("como consertar", f"mkdir -p {caminho}", largura_rotulo=16)
-                return False
-            caminho.mkdir(parents=True, exist_ok=True, mode=0o700)
-        sonda = caminho / f".probe-{dt.datetime.now():%m%d%H%M%S}"
-        inicio = dt.datetime.now()
-        sonda.write_text("backup-runner")
-        sonda.unlink()
-        levou = (dt.datetime.now() - inicio).total_seconds()
-        c.sucesso(f"escreveu e apagou {sonda.name} em {levou:.1f}s".replace(".", ","))
+    resultado = backend(destino).test()
+    if resultado.ok:
+        c.sucesso(resultado.mensagem.replace(".", ","))
         c.nota("permissões de leitura, escrita e remoção confirmadas")
         return True
-    except OSError as exc:
-        c.erro("o teste falhou")
-        c.linha("o que tentei", f"escrever e apagar uma sonda em {caminho}", largura_rotulo=16)
-        c.linha("o que recebi", str(exc), largura_rotulo=16)
-        c.linha("como consertar", f"confira as permissões de {caminho}", largura_rotulo=16)
-        return False
+    c.erro("o teste falhou")
+    for rotulo, valor in (
+        ("o que tentei", resultado.tried),
+        ("o que recebi", resultado.got),
+        ("causa provável", resultado.cause),
+        ("como consertar", resultado.fix),
+    ):
+        if valor:
+            c.linha(rotulo, valor, largura_rotulo=16)
+    return False
 
 
 # ----------------------------------------------------------------------------

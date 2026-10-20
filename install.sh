@@ -37,9 +37,24 @@ command -v mysql   >/dev/null 2>&1 || hint "cliente mysql não encontrado no PAT
 command -v mysqldump >/dev/null 2>&1 || hint "mysqldump não encontrado no PATH"
 
 if ! command -v pipx >/dev/null 2>&1; then
-    hint "instalando o pipx via pip --user"
-    python3 -m pip install --user pipx
-    python3 -m pipx ensurepath
+    # Debian 12 e Ubuntu 23.04 em diante recusam `pip install --user` no Python
+    # do sistema (PEP 668), então o pipx vem do gerenciador de pacotes quando dá.
+    if command -v apt-get >/dev/null 2>&1; then
+        SUDO=""
+        [ "$(id -u)" -ne 0 ] && SUDO="sudo"
+        hint "instalando o pipx via apt"
+        $SUDO apt-get install -y pipx || die "não consegui instalar o pipx via apt"
+    elif command -v dnf >/dev/null 2>&1; then
+        SUDO=""
+        [ "$(id -u)" -ne 0 ] && SUDO="sudo"
+        hint "instalando o pipx via dnf"
+        $SUDO dnf install -y pipx || die "não consegui instalar o pipx via dnf"
+    else
+        hint "instalando o pipx via pip --user"
+        python3 -m pip install --user pipx \
+            || die "o pip recusou instalar o pipx; instale o pipx pelo gerenciador de pacotes e rode de novo"
+    fi
+    python3 -m pipx ensurepath >/dev/null 2>&1 || pipx ensurepath >/dev/null 2>&1 || true
     export PATH="$HOME/.local/bin:$PATH"
 fi
 ok "pipx pronto"

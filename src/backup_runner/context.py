@@ -15,6 +15,7 @@ from .health import HealthItem, StagingInfo, collect, staging_info, tick_install
 from .models import Destination, Job, JobDestination, Run, RunResult, SourceKind
 from .schedule import humanize, next_run, previous_run
 from .state import State
+from . import relogio
 
 
 @dataclass
@@ -54,7 +55,7 @@ class JobView:
     def next_in_seconds(self, agora: dt.datetime | None = None) -> float | None:
         if self.paused or self.next_at is None:
             return None
-        return (self.next_at - (agora or dt.datetime.now())).total_seconds()
+        return (self.next_at - (agora or relogio.agora())).total_seconds()
 
     def schedule_human(self) -> str:
         return humanize(self.job.schedule)
@@ -68,7 +69,7 @@ class JobView:
         """
         if self.paused:
             return False
-        agora = agora or dt.datetime.now()
+        agora = agora or relogio.agora()
         if self.last_success is None:
             return self.last is not None
         limite = dt.timedelta(hours=self.job.stale_after_hours)
@@ -168,13 +169,13 @@ def cancela_execucao(ctx: "Context", run) -> dict:
             ctx.state.solta_fila(item["id"])
 
     run.result = RunResult.FAILED
-    run.finished_at = run.finished_at or dt.datetime.now()
+    run.finished_at = run.finished_at or relogio.agora()
     from .worker import _etapa_atual
 
     run.error_stage = run.error_stage or _etapa_atual(ctx.state, run)
     run.error_cause = "cancelada por você"
     run.error_fix = f"rode de novo quando quiser: backup-runner run {run.job}"
-    run.log.append((dt.datetime.now().strftime("%H:%M:%S"), "cancelado",
+    run.log.append((relogio.agora().strftime("%H:%M:%S"), "cancelado",
                     "cancelada sem worker ativo, limpeza feita na hora"))
     ctx.state.update_run(run)
     ctx.refresh()
@@ -223,7 +224,7 @@ class Context:
                 job=job,
                 last=self.state.last_run(job.name),
                 last_success=self.state.last_success(job.name),
-                next_at=next_run(job.schedule) if job.enabled else None,
+                next_at=next_run(job.schedule, tz=job.timezone) if job.enabled else None,
                 queued=job.name in posicoes,
                 running=job.name in rodando,
             )
@@ -299,7 +300,7 @@ class Context:
         return total, ativos, total - ativos
 
     def next_overall(self) -> tuple[JobView, float] | None:
-        agora = dt.datetime.now()
+        agora = relogio.agora()
         candidatos = [
             (v, v.next_in_seconds(agora))
             for v in self._views

@@ -256,6 +256,8 @@ class Settings:
         self.staging_hold_hours: int = int(d.get("staging_hold_hours", 72) or 72)
         self.history_days: int = int(d.get("history_days", 90) or 90)
         self.locale: str | None = d.get("locale")
+        # Relógio do programa: histórico, fila, pastas. Vazio usa o do servidor.
+        self.timezone: str = d.get("timezone", "America/Sao_Paulo")
 
     @classmethod
     def load(cls) -> "Settings":
@@ -270,6 +272,7 @@ class Settings:
             "staging_hold_hours": self.staging_hold_hours,
             "history_days": self.history_days,
             "locale": self.locale,
+            "timezone": self.timezone,
         }
         atomic_write(settings_file(), json.dumps(payload, indent=2, ensure_ascii=False), mode=0o600)
 

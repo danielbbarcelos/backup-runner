@@ -73,3 +73,35 @@ def test_nunca_passa_do_teto_de_partes_do_s3(tamanho):
 def test_arquivo_pequeno_nao_vira_multipart():
     cfg = _transferencia(1024)
     assert cfg.multipart_threshold == LIMIAR_MULTIPART > 1024
+
+
+def test_dest_test_do_cli_testa_s3_de_verdade(monkeypatch, capsys):
+    """Na 0.7.0 o `dest test` respondia que o envio S3 não existia, e existia."""
+    from backup_runner import forms
+
+    chamadas = []
+
+    class ClienteFalso:
+        def put_object(self, **kw):
+            chamadas.append(("put", kw["Bucket"], kw["Key"]))
+
+        def delete_object(self, **kw):
+            chamadas.append(("delete", kw["Bucket"], kw["Key"]))
+
+    monkeypatch.setattr(S3Backend, "cliente", lambda self: ClienteFalso())
+    assert forms.testa_destino(destino_s3()) is True
+    assert [c[0] for c in chamadas] == ["put", "delete"]
+    assert "não foi implementada" not in capsys.readouterr().out
+
+
+def test_dest_test_do_cli_mostra_a_causa_quando_s3_falha(monkeypatch, capsys):
+    from backup_runner import forms
+
+    class ClienteQueRecusa:
+        def put_object(self, **kw):
+            raise RuntimeError("AccessDenied")
+
+    monkeypatch.setattr(S3Backend, "cliente", lambda self: ClienteQueRecusa())
+    assert forms.testa_destino(destino_s3()) is False
+    saida = capsys.readouterr().out
+    assert "o que tentei" in saida and "AccessDenied" in saida

@@ -61,6 +61,7 @@ class StageState(str, Enum):
 
 
 class NotifyEvent(str, Enum):
+    START = "start"
     SUCCESS = "success"
     FAILURE = "failure"
     RECOVERED = "recovered"
@@ -75,6 +76,7 @@ class Channel(str, Enum):
 
 # A ordem da grade na tela de notificações.
 NOTIFY_EVENTS = [
+    NotifyEvent.START,
     NotifyEvent.SUCCESS,
     NotifyEvent.FAILURE,
     NotifyEvent.RECOVERED,
@@ -369,13 +371,14 @@ class NotifyMatrix:
     def default_global(cls) -> "NotifyMatrix":
         """Padrão de fábrica: silêncio significa sucesso.
 
-        Sucesso não avisa. Falha, recuperação, janela perdida e silêncio longo
-        avisam nos dois canais.
+        Início e sucesso não avisam. Falha, recuperação, janela perdida e
+        silêncio longo avisam nos dois canais.
         """
         m = cls()
+        quietos = (NotifyEvent.START, NotifyEvent.SUCCESS)
         for evento in NOTIFY_EVENTS:
             for canal in CHANNELS:
-                m.set(evento, canal, evento is not NotifyEvent.SUCCESS)
+                m.set(evento, canal, evento not in quietos)
         return m
 
 
@@ -495,9 +498,12 @@ class Run:
         Espaço vira %20 em chave S3 e dois-pontos quebram scp e rsync, que leem
         `host:caminho`. A ordenação alfabética coincide com a cronológica, então
         a listagem de qualquer destino já sai na ordem certa, e a idade da
-        execução sai daqui, não do mtime.
+        execução sai daqui, não do mtime. O sufixo (`-0300`) diz de que
+        relógio a hora veio.
         """
-        return self.started_at.strftime("%Y-%m-%d_%H-%M-%S")
+        from .relogio import nome_pasta
+
+        return nome_pasta(self.started_at)
 
     @property
     def ignored_total(self) -> int:

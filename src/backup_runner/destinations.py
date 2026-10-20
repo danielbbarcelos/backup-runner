@@ -17,7 +17,6 @@ from __future__ import annotations
 import datetime as dt
 import json
 import os
-import re
 import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -25,9 +24,9 @@ from typing import Callable, Protocol
 
 from .config import decrypt
 from .models import Destination, DestKind
+from . import relogio
 
 # A pasta de uma execução: data e hora, sem espaço e sem dois-pontos.
-PASTA = re.compile(r"^(\d{4}-\d{2}-\d{2})_(\d{2})-(\d{2})-(\d{2})$")
 
 
 class DestinationError(Exception):
@@ -85,14 +84,7 @@ class RemoteRun:
 
 def parse_pasta(nome: str) -> dt.datetime | None:
     """A data que está no nome da pasta, que é a idade da execução."""
-    casou = PASTA.match(nome)
-    if not casou:
-        return None
-    dia, hora, minuto, segundo = casou.groups()
-    try:
-        return dt.datetime.strptime(f"{dia} {hora}:{minuto}:{segundo}", "%Y-%m-%d %H:%M:%S")
-    except ValueError:
-        return None
+    return relogio.parse_pasta(nome)
 
 
 class Registro(Protocol):
@@ -138,7 +130,7 @@ class LocalBackend:
         self.base = Path(destino.path).expanduser()
 
     def test(self) -> TestResult:
-        inicio = dt.datetime.now()
+        inicio = relogio.agora()
         try:
             if not self.base.exists():
                 if not self.destino.create_missing:
@@ -149,7 +141,7 @@ class LocalBackend:
                         fix=f"mkdir -p {self.base}",
                     )
                 self.base.mkdir(parents=True, exist_ok=True, mode=0o700)
-            sonda = self.base / f".probe-{dt.datetime.now():%m%d%H%M%S}"
+            sonda = self.base / f".probe-{relogio.agora():%m%d%H%M%S}"
             sonda.write_text("backup-runner")
             sonda.unlink()
         except OSError as exc:
@@ -160,7 +152,7 @@ class LocalBackend:
                 cause="permissão ou disco",
                 fix=f"confira as permissões de {self.base}",
             )
-        levou = (dt.datetime.now() - inicio).total_seconds()
+        levou = (relogio.agora() - inicio).total_seconds()
         return TestResult(True, f"escreveu e apagou uma sonda em {levou:.1f}s", seconds=levou)
 
     def upload(self, pasta: Path, prefixo: str, on_progress=None,
@@ -330,8 +322,8 @@ class S3Backend:
         return "/".join(p for p in partes if p)
 
     def test(self) -> TestResult:
-        inicio = dt.datetime.now()
-        chave = self._chave("", f".probe-{dt.datetime.now():%m%d%H%M%S}")
+        inicio = relogio.agora()
+        chave = self._chave("", f".probe-{relogio.agora():%m%d%H%M%S}")
         try:
             cliente = self.cliente()
             cliente.put_object(Bucket=self.destino.bucket, Key=chave, Body=b"backup-runner")
@@ -356,7 +348,7 @@ class S3Backend:
                 cause=_causa_s3(exc),
                 fix="confira endpoint, bucket, chave e secret",
             )
-        levou = (dt.datetime.now() - inicio).total_seconds()
+        levou = (relogio.agora() - inicio).total_seconds()
         return TestResult(True, f"gravou e apagou uma sonda em {levou:.1f}s", seconds=levou)
 
     def upload(self, pasta: Path, prefixo: str, on_progress=None,
@@ -675,7 +667,7 @@ class SFTPBackend:
         return cliente
 
     def test(self) -> TestResult:
-        inicio = dt.datetime.now()
+        inicio = relogio.agora()
         try:
             cliente = self._conecta()
         except DestinationError as exc:
@@ -692,7 +684,7 @@ class SFTPBackend:
         try:
             sftp = cliente.open_sftp()
             self._garante_pasta(sftp, self.destino.remote_path)
-            sonda = f"{self.destino.remote_path.rstrip('/')}/.probe-{dt.datetime.now():%m%d%H%M%S}"
+            sonda = f"{self.destino.remote_path.rstrip('/')}/.probe-{relogio.agora():%m%d%H%M%S}"
             with sftp.open(sonda, "w") as f:
                 f.write("backup-runner")
             sftp.remove(sonda)
@@ -706,7 +698,7 @@ class SFTPBackend:
             )
         finally:
             cliente.close()
-        levou = (dt.datetime.now() - inicio).total_seconds()
+        levou = (relogio.agora() - inicio).total_seconds()
         return TestResult(True, f"escreveu e apagou uma sonda em {levou:.1f}s", seconds=levou)
 
     @staticmethod
@@ -869,7 +861,7 @@ def aplica_retencao(destino: Destination, job: str, dias: int, *, agora: dt.date
     Só roda depois de um envio bem sucedido, porque apagar o antigo antes de o
     novo chegar é a maneira mais rápida de ficar sem backup nenhum.
     """
-    agora = agora or dt.datetime.now()
+    agora = agora or relogio.agora()
     corte = agora - dt.timedelta(days=dias)
     resultado = Retencao()
     try:

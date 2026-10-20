@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import socket
 import smtplib
 import ssl
 import urllib.error
@@ -19,9 +20,11 @@ import urllib.request
 from dataclasses import dataclass
 from email.message import EmailMessage
 
+from . import __version__, relogio
 from .config import Settings, decrypt
 from .format import format_bytes, format_duration
 from .models import Channel, Job, NotifyEvent, Run, RunResult
+from .schedule import humanize
 
 
 @dataclass
@@ -48,10 +51,33 @@ def sobre_execucao(job: Job, run: Run, *, recuperado: bool = False) -> list[Envi
     evento = evento_de(run, recuperado=recuperado)
     if evento is None:
         return []
-    return despacha(job, evento, *_mensagem(job, run, evento))
+    assunto, corpo = _mensagem(job, run, evento)
+    return despacha(job, evento, assunto, corpo, slack=_cartao_execucao(job, run, evento))
 
 
-def despacha(job: Job | None, evento: NotifyEvent, assunto: str, corpo: str) -> list[Envio]:
+def sobre_inicio(job: Job, run: Run, *, atrasado: bool = False) -> list[Envio]:
+    """O aviso de que o backup começou. Desligado no padrão de fábrica."""
+    quando = _quando(run.started_at)
+    assunto = f"[backup-runner] início: {job.name} {run.started_at:%d/%m %H:%M}"
+    destinos = ", ".join(d.name for d in job.destinations) or "nenhum"
+    corpo = "\n".join([
+        f"job        {job.name}",
+        f"origem     {job.source.target()}",
+        f"início     {quando}" + (" (atrasado)" if atrasado else ""),
+        f"destinos   {destinos}",
+    ])
+    campos = [
+        ("Origem", f"`{_esc(job.source.target())}`"),
+        ("Início", quando + (" · atrasado" if atrasado else "")),
+        ("Destinos", _esc(destinos)),
+        ("Agenda", _esc(humanize(job.schedule))),
+    ]
+    cartao = _cartao(NotifyEvent.START, job.name, campos, rodape_extra=f"execução {run.id}")
+    return despacha(job, NotifyEvent.START, assunto, corpo, slack=cartao)
+
+
+def despacha(job: Job | None, evento: NotifyEvent, assunto: str, corpo: str,
+             *, slack: dict | None = None) -> list[Envio]:
     settings = Settings.load()
     padrao = settings.notify_global
     matriz = job.notify if job is not None else padrao
@@ -65,7 +91,7 @@ def despacha(job: Job | None, evento: NotifyEvent, assunto: str, corpo: str) -> 
         if canal is Channel.EMAIL:
             enviados.append(_email(settings, assunto, corpo))
         else:
-            enviados.append(_slack(settings, assunto, corpo))
+            enviados.append(_slack(settings, assunto, corpo, payload=slack))
     return enviados
 
 
@@ -76,6 +102,7 @@ def despacha(job: Job | None, evento: NotifyEvent, assunto: str, corpo: str) -> 
 def _mensagem(job: Job, run: Run, evento: NotifyEvent) -> tuple[str, str]:
     quando = run.started_at.strftime("%d/%m %H:%M")
     marcas = {
+        NotifyEvent.START: "início",
         NotifyEvent.SUCCESS: "ok",
         NotifyEvent.FAILURE: "FALHA",
         NotifyEvent.RECOVERED: "recuperado",
@@ -135,7 +162,112 @@ def sobre_silencio(job: Job, horas: int, ultima: dt.datetime | None) -> list[Env
         "",
         "  backup-runner health",
     ])
-    return despacha(job, NotifyEvent.STALE, assunto, corpo)
+    campos = [
+        ("Último sucesso", _quando(ultima) if ultima else "nunca"),
+        ("Limite aceito", f"{horas} h"),
+    ]
+    cartao = _cartao(
+        NotifyEvent.STALE, job.name, campos,
+        titulo=f"Sem backup há mais de {horas} h",
+        detalhe=("Costuma ser o tick fora do crontab, o worker parado ou o job pausado "
+                 "sem querer. O diagnóstico responde qual dos três: `backup-runner health`"),
+    )
+    return despacha(job, NotifyEvent.STALE, assunto, corpo, slack=cartao)
+
+
+# ----------------------------------------------------------------------------
+# Cartão do Slack
+# ----------------------------------------------------------------------------
+
+# Ícone, cor da barra lateral e título de cada evento. A cor é o que se lê de
+# relance numa coluna de avisos; o ícone é o que aparece na notificação do
+# celular, onde a cor não chega.
+ESTILO: dict[NotifyEvent, tuple[str, str, str]] = {
+    NotifyEvent.START: ("▶️", "#3b82f6", "Backup iniciado"),
+    NotifyEvent.SUCCESS: ("✅", "#22c55e", "Backup concluído"),
+    NotifyEvent.RECOVERED: ("✅", "#22c55e", "Backup voltou a funcionar"),
+    NotifyEvent.FAILURE: ("🚨", "#ef4444", "Backup falhou"),
+    NotifyEvent.MISSED: ("⚠️", "#f59e0b", "Janela perdida"),
+    NotifyEvent.STALE: ("⏰", "#f59e0b", "Sem backup recente"),
+}
+
+
+def _esc(texto: str) -> str:
+    """O Slack lê `&`, `<` e `>` como marcação."""
+    return texto.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def _quando(momento: dt.datetime) -> str:
+    return f"{momento:%d/%m %H:%M} ({relogio.rotulo_fuso(momento)})"
+
+
+def _cartao(evento: NotifyEvent, job: str, campos: list[tuple[str, str]], *,
+            titulo: str | None = None, detalhe: str | None = None,
+            rodape_extra: str | None = None) -> dict:
+    icone, cor, titulo_padrao = ESTILO[evento]
+    titulo = titulo or titulo_padrao
+    blocos: list[dict] = [
+        {"type": "section", "text": {"type": "mrkdwn", "text": f"{icone} *{titulo}*  ·  *{_esc(job)}*"}},
+    ]
+    visiveis = [(r, v) for r, v in campos if v][:10]   # o Slack aceita dez campos por seção
+    if visiveis:
+        blocos.append({
+            "type": "section",
+            "fields": [{"type": "mrkdwn", "text": f"*{r}*\n{v}"} for r, v in visiveis],
+        })
+    if detalhe:
+        blocos.append({"type": "section", "text": {"type": "mrkdwn", "text": detalhe}})
+    rodape = [f"🖥️ {_esc(socket.gethostname())}", f"backup-runner {__version__}"]
+    if rodape_extra:
+        rodape.append(rodape_extra)
+    blocos.append({"type": "context", "elements": [{"type": "mrkdwn", "text": "  ·  ".join(rodape)}]})
+    return {
+        # `text` é o que aparece na notificação e em cliente sem suporte a blocos.
+        "text": f"{icone} {titulo}: {job}",
+        "attachments": [{"color": cor, "blocks": blocos}],
+    }
+
+
+def _cartao_execucao(job: Job, run: Run, evento: NotifyEvent) -> dict:
+    titulo = None
+    if run.result is RunResult.PENDING_UPLOAD:
+        titulo = "Backup pronto, envio pendente"
+
+    campos = [
+        ("Origem", f"`{_esc(job.source.target())}`"),
+        ("Início", _quando(run.started_at)),
+    ]
+    if run.duration:
+        campos.append(("Duração", format_duration(run.duration)))
+    if run.bytes:
+        campos.append(("Tamanho", format_bytes(run.bytes)))
+    if run.destinations_done:
+        campos.append(("Enviado para", _esc(", ".join(run.destinations_done))))
+    if run.destinations_pending:
+        campos.append(("Pendente", _esc(", ".join(run.destinations_pending))))
+    if evento in (NotifyEvent.SUCCESS, NotifyEvent.RECOVERED):
+        campos.append(("Pasta", f"`{run.folder}`"))
+    if evento is NotifyEvent.MISSED and run.error_cause:
+        campos.append(("Motivo", _esc(run.error_cause)))
+
+    detalhe = None
+    if run.error_stage:
+        linhas = [f"*Falhou no estágio* `{run.error_stage.value}`"]
+        for rotulo, valor in (
+            ("O que tentei", run.error_tried),
+            ("O que recebi", run.error_got),
+            ("Causa provável", run.error_cause),
+            ("Como consertar", run.error_fix),
+        ):
+            if valor:
+                linhas.append(f"*{rotulo}:* {_esc(valor)}")
+        if run.result is RunResult.PENDING_UPLOAD:
+            linhas.append(f"O artefato está no staging e o worker tenta de novo sozinho. "
+                          f"Para forçar agora: `backup-runner retry {run.id}`")
+        detalhe = "\n".join(linhas)
+
+    return _cartao(evento, job.name, campos, titulo=titulo, detalhe=detalhe,
+                   rodape_extra=f"`backup-runner run-info {run.id}`")
 
 
 # ----------------------------------------------------------------------------
@@ -175,12 +307,12 @@ def _email(settings: Settings, assunto: str, corpo: str) -> Envio:
     return Envio("email", True, smtp.get("to", ""))
 
 
-def _slack(settings: Settings, assunto: str, corpo: str) -> Envio:
+def _slack(settings: Settings, assunto: str, corpo: str, *, payload: dict | None = None) -> Envio:
     webhook = decrypt(settings.slack.get("webhook_enc"))
     if not webhook:
         return Envio("slack", False, "webhook não configurado")
 
-    payload = json.dumps({
+    payload = json.dumps(payload or {
         "text": f"*{assunto}*\n```{corpo}```",
     }).encode()
     requisicao = urllib.request.Request(
@@ -204,4 +336,6 @@ def teste(canal: str) -> Envio:
     corpo = "Se você está lendo isto, o canal está configurado corretamente."
     if canal == "email":
         return _email(settings, assunto, corpo)
-    return _slack(settings, assunto, corpo)
+    cartao = _cartao(NotifyEvent.SUCCESS, "teste de aviso", [], titulo="Canal configurado",
+                     detalhe=corpo)
+    return _slack(settings, assunto, corpo, payload=cartao)

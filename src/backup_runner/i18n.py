@@ -326,6 +326,8 @@ PT: dict[str, str] = {
     "notif.global": "global",
     "notif.overridden": "sobrescrito",
     "notif.same_global": "= global",
+    "notif.ev_start": "início",
+    "notif.ev_start_why": "backup começou a rodar",
     "notif.ev_success": "sucesso",
     "notif.ev_success_why": "backup terminou bem",
     "notif.ev_failure": "falha",

@@ -34,6 +34,7 @@ from .models import (
     StageState,
 )
 from .state import State
+from . import relogio
 
 
 def populate() -> None:
@@ -130,7 +131,7 @@ def _historico() -> None:
     estado = State()
     estado.conn.execute("DELETE FROM runs")
     estado.clear_queue()
-    hoje = dt.datetime.now().replace(second=0, microsecond=0)
+    hoje = relogio.agora().replace(second=0, microsecond=0)
 
     for dias in range(1, 12):
         base = (hoje - dt.timedelta(days=dias)).replace(hour=3, minute=0)

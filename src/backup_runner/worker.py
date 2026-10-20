@@ -40,6 +40,7 @@ from .models import (
     StageState,
 )
 from .state import RAIA_ENVIO, RAIA_PRODUCAO, RAIAS, PartesDeEnvio, State
+from . import relogio
 
 
 class Cancelado(Exception):
@@ -237,8 +238,8 @@ def executa_item(item: dict, estado: State) -> Resultado:
     job = jobs.get(item["job"])
     if job is None:
         run = Run(
-            id=0, job=item["job"], started_at=dt.datetime.now(),
-            finished_at=dt.datetime.now(), result=RunResult.FAILED,
+            id=0, job=item["job"], started_at=relogio.agora(),
+            finished_at=relogio.agora(), result=RunResult.FAILED,
             error_cause="o job não existe mais",
         )
         estado.insert_run(run)
@@ -256,10 +257,11 @@ def executa_item(item: dict, estado: State) -> Resultado:
 
 def executa(job: Job, estado: State, *, atrasado: bool = False,
             queue_id: int | None = None) -> Resultado:
-    inicio = dt.datetime.now()
+    inicio = relogio.agora()
     run = Run(id=0, job=job.name, started_at=inicio, result=RunResult.RUNNING)
     run.log.append((inicio.strftime("%H:%M:%S"), "worker", f"execução de {job.name} iniciada"))
     estado.insert_run(run)
+    _avisa_inicio(job, run, atrasado=atrasado)
 
     pasta = staging_dir() / job.name / run.folder
     pasta.mkdir(parents=True, exist_ok=True)
@@ -308,7 +310,7 @@ def _executa_vigiado(
     run.result = RunResult.QUEUED
     prog.etapa("aguardando envio", run.artifact or "")
     run.log.append((
-        dt.datetime.now().strftime("%H:%M:%S"), "worker",
+        relogio.agora().strftime("%H:%M:%S"), "worker",
         "artefato pronto, esperando a raia de envio",
     ))
     estado.update_run(run)
@@ -343,7 +345,7 @@ def _dump(job: Job, run: Run, pasta: Path, limite: dt.datetime, prog: Progresso,
     ignoradas = sorted(set(por_regex) | set(por_mao))
 
     run.log.append((
-        dt.datetime.now().strftime("%H:%M:%S"), "dump",
+        relogio.agora().strftime("%H:%M:%S"), "dump",
         f"{len(tabelas)} tabelas, {len(ignoradas)} sem dados",
     ))
 
@@ -381,7 +383,7 @@ def _dump(job: Job, run: Run, pasta: Path, limite: dt.datetime, prog: Progresso,
         f"{_pct(resultado.ratio)} menor, em fluxo", 0.0,
     ))
     run.log.append((
-        dt.datetime.now().strftime("%H:%M:%S"), "dump",
+        relogio.agora().strftime("%H:%M:%S"), "dump",
         f"{_tam(resultado.bytes_raw)} crus viraram {_tam(resultado.bytes_written)}",
     ))
 
@@ -421,14 +423,14 @@ def _arquiva(job: Job, run: Run, pasta: Path, limite: dt.datetime, prog: Progres
         f"{_tam(resultado.bytes_written)} finais, {_pct(resultado.ratio)} menor", 0.0,
     ))
     run.log.append((
-        dt.datetime.now().strftime("%H:%M:%S"), "leitura",
+        relogio.agora().strftime("%H:%M:%S"), "leitura",
         f"{_plural(resultado.files, 'arquivo')}"
         + (f", {resultado.skipped} fora pelas exclusões" if resultado.skipped else ""),
     ))
 
 
 def _checa_prazo(limite: dt.datetime) -> None:
-    if dt.datetime.now() > limite:
+    if relogio.agora() > limite:
         raise TimeoutError("o job passou do tempo limite")
 
 
@@ -560,7 +562,7 @@ class Vigilancia(threading.Thread):
             return ("cancelado", "cancelada por você")
         if JobStore.load().get(self.job) is None:
             return ("job_removido", f"o job {self.job} foi apagado")
-        if dt.datetime.now() > self.limite:
+        if relogio.agora() > self.limite:
             return ("prazo", "o job passou do tempo limite")
         return None
 
@@ -586,7 +588,7 @@ class Vigilancia(threading.Thread):
                     self.estado.solta_fila(self.queue_id)
                 return
             self.execucao.result = RunResult.FAILED
-            self.execucao.finished_at = dt.datetime.now()
+            self.execucao.finished_at = relogio.agora()
             self.execucao.duration = (self.execucao.finished_at - self.execucao.started_at).total_seconds()
             self.execucao.error_stage = (
                 self.execucao.error_stage or _etapa_atual(self.estado, self.execucao)
@@ -700,7 +702,7 @@ def _envia(
             run.error_fix = ("aumente o timeout do job, ou deixe o reenvio automático"
                              " terminar o que falta")
             run.log.append((
-                dt.datetime.now().strftime("%H:%M:%S"), ligacao.name,
+                relogio.agora().strftime("%H:%M:%S"), ligacao.name,
                 "envio interrompido pelo prazo do job",
             ))
             continue
@@ -716,7 +718,7 @@ def _envia(
             run.error_cause = _causa(destino, exc)
             run.error_fix = "abra o destino, teste, e use retry quando resolver"
             run.log.append((
-                dt.datetime.now().strftime("%H:%M:%S"), ligacao.name, "falhou no envio",
+                relogio.agora().strftime("%H:%M:%S"), ligacao.name, "falhou no envio",
             ))
             continue
 
@@ -731,7 +733,7 @@ def _envia(
             destino.location(), time.monotonic() - inicio,
         ))
         run.log.append((
-            dt.datetime.now().strftime("%H:%M:%S"), ligacao.name,
+            relogio.agora().strftime("%H:%M:%S"), ligacao.name,
             f"{_tam(enviados)} enviados",
         ))
     estado.update_run(run)
@@ -752,16 +754,16 @@ def envia_artefato(job: Job, estado: State, item: dict) -> Resultado:
     if JobStore.load().get(job.name) is None:
         # O tick enfileirou, o job sumiu antes de o item ser atendido.
         return Resultado(
-            Run(id=0, job=job.name, started_at=dt.datetime.now(),
-                finished_at=dt.datetime.now(), result=RunResult.OK),
+            Run(id=0, job=job.name, started_at=relogio.agora(),
+                finished_at=relogio.agora(), result=RunResult.OK),
             True, "job apagado, envio descartado",
         )
 
     run = _execucao_do_item(estado, job, item)
     if run is None:
         return Resultado(
-            Run(id=0, job=job.name, started_at=dt.datetime.now(),
-                finished_at=dt.datetime.now(), result=RunResult.OK,
+            Run(id=0, job=job.name, started_at=relogio.agora(),
+                finished_at=relogio.agora(), result=RunResult.OK,
                 error_cause="nada a enviar"),
             True, "nada a enviar",
         )
@@ -769,7 +771,7 @@ def envia_artefato(job: Job, estado: State, item: dict) -> Resultado:
     pasta = staging_dir() / job.name / run.folder
     if not pasta.is_dir():
         run.result = RunResult.FAILED
-        run.finished_at = run.finished_at or dt.datetime.now()
+        run.finished_at = run.finished_at or relogio.agora()
         run.error_stage = Stage.UPLOAD
         run.error_cause = "o artefato não está mais no staging"
         run.error_fix = f"rode o job de novo: backup-runner run {job.name}"
@@ -829,7 +831,7 @@ def _envia_vigiado(
     except Exception as exc:  # noqa: BLE001 - o worker não pode morrer por um job
         return _falha(run, estado, Stage.UPLOAD, exc, job)
 
-    run.finished_at = dt.datetime.now()
+    run.finished_at = relogio.agora()
     run.duration = (run.finished_at - run.started_at).total_seconds()
 
     if run.destinations_pending:
@@ -882,7 +884,7 @@ def _retencao(job: Job, run: Run) -> None:
         total += len(resultado.apagadas)
         if resultado.apagadas:
             run.log.append((
-                dt.datetime.now().strftime("%H:%M:%S"), "retenção",
+                relogio.agora().strftime("%H:%M:%S"), "retenção",
                 f"{ligacao.name}: {len(resultado.apagadas)} antigas apagadas",
             ))
     if total:
@@ -940,7 +942,7 @@ def _sha256(caminho: Path, sentinela: "Sentinela | None" = None) -> str:
 
 
 def _falha(run: Run, estado: State, estagio: Stage, exc: Exception, job: Job, *, limpa: Path | None = None) -> Resultado:
-    run.finished_at = dt.datetime.now()
+    run.finished_at = relogio.agora()
     run.duration = (run.finished_at - run.started_at).total_seconds()
     run.result = RunResult.FAILED
     run.error_stage = estagio
@@ -1032,7 +1034,7 @@ def _cancela(run: Run, estado: State, pasta: Path, texto: str) -> Resultado:
     alerta do que você mesmo acabou de pedir é ruído.
     """
     run.result = RunResult.FAILED
-    run.finished_at = dt.datetime.now()
+    run.finished_at = relogio.agora()
     run.duration = (run.finished_at - run.started_at).total_seconds()
     run.error_stage = run.error_stage or _etapa_atual(estado, run)
     run.error_cause = texto
@@ -1048,6 +1050,15 @@ def _cancela(run: Run, estado: State, pasta: Path, texto: str) -> Resultado:
         pass
     estado.update_run(run)
     return Resultado(run, False, texto)
+
+
+def _avisa_inicio(job: Job, run: Run, *, atrasado: bool = False) -> None:
+    from . import notify
+
+    try:
+        notify.sobre_inicio(job, run, atrasado=atrasado)
+    except Exception:  # noqa: BLE001 - aviso que falha não derruba o backup
+        pass
 
 
 def _avisa(job: Job, run: Run, *, recuperado: bool = False) -> None:

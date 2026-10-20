@@ -14,6 +14,7 @@ import datetime as dt
 from dataclasses import dataclass
 
 from .i18n import t
+from . import relogio
 
 CAMPOS = [
     ("minute", 0, 59),
@@ -149,18 +150,26 @@ class Cron:
         return self.expressao
 
 
-def next_run(expressao: str, depois: dt.datetime | None = None) -> dt.datetime | None:
+def next_run(
+    expressao: str, depois: dt.datetime | None = None, tz: str | None = None,
+) -> dt.datetime | None:
     try:
-        return Cron.parse(expressao).next_after(depois or dt.datetime.now())
+        cron = Cron.parse(expressao)
     except CronError:
         return None
+    proxima = cron.next_after(relogio.para_fuso(depois or relogio.agora(), tz))
+    return relogio.do_fuso(proxima, tz) if proxima else None
 
 
-def previous_run(expressao: str, antes: dt.datetime | None = None) -> dt.datetime | None:
+def previous_run(
+    expressao: str, antes: dt.datetime | None = None, tz: str | None = None,
+) -> dt.datetime | None:
     try:
-        return Cron.parse(expressao).prev_before(antes or dt.datetime.now())
+        cron = Cron.parse(expressao)
     except CronError:
         return None
+    anterior = cron.prev_before(relogio.para_fuso(antes or relogio.agora(), tz))
+    return relogio.do_fuso(anterior, tz) if anterior else None
 
 
 def humanize(expressao: str) -> str:

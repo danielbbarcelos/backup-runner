@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from .config import state_file
+from . import relogio
 from .models import (
     ManifestEntry,
     Run,
@@ -196,7 +197,7 @@ class State:
         A chave única (job, due_at, kind) é o que torna o tick idempotente: ele
         pode rodar a cada minuto sem duplicar a execução das 3h.
         """
-        agora = dt.datetime.now()
+        agora = relogio.agora()
         try:
             cur = self.conn.execute(
                 "INSERT INTO queue (job, due_at, enqueued_at, status, late, kind, run_id)"
@@ -234,7 +235,7 @@ class State:
             # em andamento de rastro de worker morto.
             self.conn.execute(
                 "UPDATE queue SET status='running', claimed_pid=?, claimed_at=? WHERE id=?",
-                (os.getpid(), _fmt(dt.datetime.now()), linha["id"]),
+                (os.getpid(), _fmt(relogio.agora()), linha["id"]),
             )
             self.conn.execute("COMMIT")
             return dict(linha)
@@ -382,7 +383,7 @@ class State:
         self.conn.execute(
             "UPDATE runs SET prog_stage=?, prog_done=?, prog_total=?, prog_label=?,"
             " prog_pid=COALESCE(?, prog_pid), heartbeat=? WHERE id=?",
-            (stage, done, total, label, pid, _fmt(dt.datetime.now()), run_id),
+            (stage, done, total, label, pid, _fmt(relogio.agora()), run_id),
         )
 
     def bate_coracao(self, run_id: int) -> None:
@@ -394,14 +395,14 @@ class State:
         """
         self.conn.execute(
             "UPDATE runs SET heartbeat=?, prog_pid=COALESCE(prog_pid, ?) WHERE id=?",
-            (_fmt(dt.datetime.now()), os.getpid(), run_id),
+            (_fmt(relogio.agora()), os.getpid(), run_id),
         )
 
     def pede_cancelamento(self, run_id: int) -> bool:
         """Marca o pedido. Devolve se havia execução para marcar."""
         cur = self.conn.execute(
             "UPDATE runs SET cancel_at=? WHERE id=? AND cancel_at IS NULL",
-            (_fmt(dt.datetime.now()), run_id),
+            (_fmt(relogio.agora()), run_id),
         )
         return cur.rowcount > 0
 
@@ -433,9 +434,8 @@ class State:
         varredura de staging saber se pode apagar: execução viva ou com envio
         pendente é intocável.
         """
-        try:
-            inicio = dt.datetime.strptime(pasta, "%Y-%m-%d_%H-%M-%S")
-        except ValueError:
+        inicio = relogio.parse_pasta(pasta)
+        if inicio is None:
             return None
         linha = self.conn.execute(
             "SELECT * FROM runs WHERE job=? AND started_at=? ORDER BY id DESC LIMIT 1",
@@ -511,7 +511,7 @@ class State:
         nulo e caem fora: sem batida nenhuma não há como distinguir um worker
         morto de um que nunca soube reportar.
         """
-        corte = _fmt(dt.datetime.now() - dt.timedelta(seconds=limite_segundos))
+        corte = _fmt(relogio.agora() - dt.timedelta(seconds=limite_segundos))
         linhas = self.conn.execute(
             "SELECT * FROM runs WHERE result=? AND heartbeat IS NOT NULL AND heartbeat < ?"
             " ORDER BY id",
@@ -552,7 +552,7 @@ class State:
         return cur.rowcount
 
     def prune_history(self, dias: int) -> int:
-        corte = dt.datetime.now() - dt.timedelta(days=dias)
+        corte = relogio.agora() - dt.timedelta(days=dias)
         cur = self.conn.execute("DELETE FROM runs WHERE started_at < ?", (_fmt(corte),))
         return cur.rowcount
 
@@ -672,7 +672,7 @@ def _row_to_run(linha: sqlite3.Row) -> Run:
     return Run(
         id=int(linha["id"]),
         job=linha["job"],
-        started_at=_parse(linha["started_at"]) or dt.datetime.now(),
+        started_at=_parse(linha["started_at"]) or relogio.agora(),
         finished_at=_parse(linha["finished_at"]),
         result=RunResult(linha["result"]),
         bytes=linha["bytes"],

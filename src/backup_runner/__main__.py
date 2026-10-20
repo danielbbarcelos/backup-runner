@@ -30,6 +30,7 @@ from . import APP_SLUG, __version__
 from . import console as c
 from . import prompt
 from .i18n import set_locale
+from . import relogio
 
 
 def _ctx():
@@ -151,7 +152,7 @@ def cmd_job(args: argparse.Namespace) -> int:
     if args.pausar:
         job = view.job
         job.enabled = not job.enabled
-        job.paused_at = None if job.enabled else dt.date.today().strftime("%d/%m")
+        job.paused_at = None if job.enabled else relogio.agora().date().strftime("%d/%m")
         ctx.jobs.put(job)
         c.sucesso(f"{job.name} " + ("retomado" if job.enabled else "pausado"))
         return 0
@@ -184,7 +185,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     if view is None:
         c.erro(f"não existe job chamado {args.nome}")
         return 1
-    ctx.state.enqueue(args.nome, dt.datetime.now())
+    ctx.state.enqueue(args.nome, relogio.agora())
     c.sucesso(f"{args.nome} entrou na fila")
     if not ctx.worker.running:
         c.nota("o worker não está de pé, então a fila espera")
@@ -204,7 +205,7 @@ def cmd_history(args: argparse.Namespace) -> int:
     resultados = None
     if args.falhas:
         resultados = [RunResult.FAILED, RunResult.MISSED, RunResult.PENDING_UPLOAD, RunResult.LATE]
-    desde = dt.datetime.now() - dt.timedelta(days=args.dias) if args.dias else None
+    desde = relogio.agora() - dt.timedelta(days=args.dias) if args.dias else None
     execucoes = ctx.state.runs(job=args.job, results=resultados, since=desde, limit=args.limite)
     filtro = ", ".join(x for x in [args.job, "falhas" if args.falhas else None] if x)
     views.historico(ctx, execucoes, filtro=filtro)
@@ -289,7 +290,7 @@ def cmd_retry(args: argparse.Namespace) -> int:
     if run.result is not RunResult.PENDING_UPLOAD:
         c.erro("essa execução não tem envio pendente")
         return 1
-    ctx.state.enqueue(run.job, dt.datetime.now(), kind="upload_retry")
+    ctx.state.enqueue(run.job, relogio.agora(), kind="upload_retry")
     c.sucesso(f"reenvio de {run.job} na fila, usando o artefato do staging")
     return 0
 

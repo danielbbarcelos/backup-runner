@@ -22,6 +22,7 @@ from .format import (
 from .health import Level, summary
 from .models import CHANNELS, NOTIFY_EVENTS, RunResult, SourceKind
 from .schedule import humanize
+from . import relogio
 
 # Símbolo e cor de cada resultado. O símbolo é a informação; a cor, reforço.
 BADGE = {
@@ -46,7 +47,7 @@ def badge(resultado: RunResult | None, *, curto: bool = False) -> str:
 def quando(momento: dt.datetime | None) -> str:
     if momento is None:
         return c.SYM_NONE
-    hoje = dt.date.today()
+    hoje = relogio.agora().date()
     if momento.date() == hoje:
         return momento.strftime("hoje %H:%M")
     if momento.date() == hoje + dt.timedelta(days=1):
@@ -81,7 +82,7 @@ def andamento(ctx: Context) -> bool:
     etapa = prog.get("prog_stage")
     feito, total = prog.get("prog_done") or 0, prog.get("prog_total") or 0
     rotulo, batida = prog.get("prog_label") or "", prog.get("heartbeat")
-    decorrido = (dt.datetime.now() - run.started_at).total_seconds()
+    decorrido = (relogio.agora() - run.started_at).total_seconds()
 
     c.secao(f"em execução: {run.job}")
     if etapa:
@@ -115,7 +116,7 @@ def andamento(ctx: Context) -> bool:
     if vista is not None:
         minutos = vista.job.timeout_minutes
         sobra = (run.started_at + dt.timedelta(minutes=minutos)
-                 - dt.datetime.now()).total_seconds()
+                 - relogio.agora()).total_seconds()
         texto = f"limite de {minutos} min, {format_relative(max(sobra, 0))} restantes"
         if sobra <= 0:
             c.linha("prazo", c.danger(f"{c.SYM_FAIL} passou do limite de {minutos} min"))
@@ -127,7 +128,7 @@ def andamento(ctx: Context) -> bool:
         else:
             c.linha("prazo", c.muted(texto))
 
-    atraso = (dt.datetime.now() - batida).total_seconds() if batida else None
+    atraso = (relogio.agora() - batida).total_seconds() if batida else None
     pid = prog.get("prog_pid")
     if prog.get("cancel_at"):
         c.linha("cancelamento", c.warn(
@@ -317,6 +318,7 @@ def detalhe_job(ctx: Context, view: JobView, *, dicas: bool = True) -> None:
 
 def _nome_evento(evento) -> str:
     return {
+        "start": "início",
         "success": "sucesso",
         "failure": "falha",
         "recovered": "recuperado",
@@ -330,7 +332,9 @@ def _nome_evento(evento) -> str:
 # ----------------------------------------------------------------------------
 
 def _tabela_execucoes(execucoes, *, com_job: bool = True) -> None:
-    cabecalho = ["nº", "quando", "job", "resultado", "tamanho", "duração", "destinos"]
+    # O fuso no cabeçalho: o servidor pode estar em UTC e o histórico não.
+    quando = f"quando ({relogio.rotulo_fuso(relogio.agora())})"
+    cabecalho = ["nº", quando, "job", "resultado", "tamanho", "duração", "destinos"]
     alinhamento = "rlllrrl"
     if not com_job:
         cabecalho.pop(2)
@@ -373,7 +377,7 @@ def detalhe_execucao(ctx: Context, run) -> None:
     simbolo, rotulo, cor = BADGE[run.result]
     c.titulo(
         f"execução {run.id}: {run.job}",
-        sub=f"{run.started_at:%d/%m/%Y %H:%M}",
+        sub=f"{run.started_at:%d/%m/%Y %H:%M} ({relogio.rotulo_fuso(run.started_at)})",
     )
     c.linha("resultado", c.cor(f"{simbolo} {rotulo}", cor))
     c.linha("tamanho", format_bytes(run.bytes))

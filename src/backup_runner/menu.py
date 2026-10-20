@@ -19,6 +19,7 @@ from . import __version__
 from .context import Context
 from .models import RunResult
 from .views import _plural
+from . import relogio
 
 
 def moldura(ctx: Context, *trilha: str) -> None:
@@ -401,15 +402,11 @@ def menu_saude(ctx: Context) -> None:
 # ----------------------------------------------------------------------------
 
 def _agora():
-    import datetime
-
-    return datetime.datetime.now()
+    return relogio.agora()
 
 
 def _hoje() -> str:
-    import datetime
-
-    return datetime.date.today().strftime("%d/%m")
+    return relogio.agora().date().strftime("%d/%m")
 
 
 def _avisa_sem_worker(ctx: Context) -> None:
