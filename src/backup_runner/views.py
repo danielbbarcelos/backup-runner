@@ -20,7 +20,7 @@ from .format import (
     progress_bar,
 )
 from .health import Level, summary
-from .models import CHANNELS, NOTIFY_EVENTS, RunResult, SourceKind
+from .models import CHANNELS, NOTIFY_EVENTS, FilesMode, RunResult, SourceKind
 from .schedule import humanize
 from . import relogio
 
@@ -263,7 +263,10 @@ def detalhe_job(ctx: Context, view: JobView, *, dicas: bool = True) -> None:
     else:
         fonte = job.source
         c.linha("fonte", f"arquivos  {fonte.path}")
-        c.linha("formato", fonte.archive_format.value)
+        if fonte.mode is FilesMode.SYNC:
+            c.linha("modo", f"sync (espelho; para se for apagar mais de {fonte.max_delete_pct}%)")
+        else:
+            c.linha("formato", fonte.archive_format.value)
         ativos = fonte.active_excludes()
         c.linha("excluir", ", ".join(ativos) if ativos else c.muted("nada"))
 

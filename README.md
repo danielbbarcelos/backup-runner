@@ -343,6 +343,39 @@ Dois detalhes que derrubam a configuração e não são óbvios:
   normal o bucket vira subdomínio, e o certificado curinga do provedor cobre um
   nível só: `a.b.nyc3.provedor.com` não casa com `*.nyc3.provedor.com`. O
   programa detecta o ponto e troca o modo sozinho.
+- **Classe de armazenamento** (`storage_class` no destino): vazio é o padrão do
+  provedor. `STANDARD_IA` custa perto da metade e serve para backup, que quase
+  nunca é lido, mas cobra 30 dias e 128 KB mínimos por objeto.
+
+### Pasta grande: modo sync
+
+O modo padrão de um job de arquivos (`archive`) monta um `.tar.gz` inteiro no
+staging a cada execução. Para uma pasta de centenas de gigabytes isso exige o
+mesmo espaço livre e reenvia tudo todo dia.
+
+O modo `sync` espelha a pasta num destino S3, sem staging: sobe só o arquivo
+novo ou alterado (tamanho diferente, ou mtime mais novo que o objeto) e apaga
+no destino o que sumiu do disco. A comparação sai da listagem do bucket, sem
+uma requisição por arquivo. O histórico fica com o bucket:
+
+- **versionamento ligado**, para o arquivo apagado ou alterado continuar
+  recuperável;
+- **regra de ciclo de vida** que expira versões antigas, por exemplo em 30
+  dias. A versão atual de um arquivo que nunca muda fica para sempre.
+
+Se for apagar mais que `max_delete_pct` dos arquivos (padrão 5%), o sync sobe o
+que mudou, não apaga nada e falha com aviso: remoção em massa é o sintoma de um
+`rm` por engano ou de ransomware. Um job sync roda direto na raia de envio, então
+uma primeira cópia de horas não segura o dump de outro job. A execução que passa
+do tempo limite continua de onde parou na próxima.
+
+### Espaço no staging
+
+O worker confere o disco do staging antes de gerar o artefato e de novo durante
+a escrita. Com menos que `staging_min_free_gb` livres (padrão 5) ou mais que
+`staging_max_disk_pct` usado (padrão 90), a execução para, apaga o parcial e
+avisa, em vez de encher o disco do servidor. `staging_path` no `settings.json`
+leva o staging para outro volume.
 
 ## Comandos
 

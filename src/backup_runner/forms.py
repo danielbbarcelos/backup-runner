@@ -15,6 +15,7 @@ from .config import decrypt, encrypt
 from .context import Context
 from .format import format_bytes, format_count, format_relative
 from .models import (
+    FilesMode,
     ArchiveFormat,
     Destination,
     DestKind,
@@ -188,6 +189,19 @@ def job_arquivos(ctx: Context, job: Job | None = None) -> Job | None:
         return None
 
     fonte.path = prompt.texto("diretório", padrao=fonte.path, obrigatorio=True, valida=valida_dir)
+    fonte.mode = FilesMode(
+        prompt.escolhe(
+            "modo",
+            [(FilesMode.ARCHIVE.value, "archive  (um .tar.gz por execução, numa pasta datada)"),
+             (FilesMode.SYNC.value, "sync     (espelho no S3: só o que mudou; para pastas grandes)")],
+            padrao=fonte.mode.value,
+        )
+    )
+    if fonte.mode is FilesMode.SYNC:
+        c.nota("o histórico fica no versionamento do bucket; ligue o versionamento e uma regra de ciclo de vida")
+        fonte.max_delete_pct = prompt.inteiro(
+            "parar se for apagar mais que (% dos arquivos)", padrao=fonte.max_delete_pct, minimo=1,
+        )
     fonte.archive_format = ArchiveFormat(
         prompt.escolhe(
             "formato",
@@ -324,7 +338,8 @@ def _confirma_e_salva(ctx: Context, job: Job, tabelas: list) -> Job | None:
             ignoradas = len(por_regex) + len(por_mao)
             c.linha("tabelas", f"{len(tabelas) - ignoradas} entram, {ignoradas} ignoradas")
     else:
-        c.linha("fonte", f"arquivos  {job.source.path}  ({job.source.archive_format.value})")
+        modo = "sync" if job.source.mode is FilesMode.SYNC else job.source.archive_format.value
+        c.linha("fonte", f"arquivos  {job.source.path}  ({modo})")
 
     c.linha("quando", humanize(job.schedule))
     if job.destinations:
@@ -386,6 +401,9 @@ def novo_destino(ctx: Context, destino: Destination | None = None) -> Destinatio
         destino.region = prompt.texto("região", padrao=destino.region or "nyc3", obrigatorio=True)
         destino.bucket = prompt.texto("bucket", padrao=destino.bucket, obrigatorio=True)
         destino.prefix = prompt.texto("prefixo (opcional)", padrao=destino.prefix)
+        destino.storage_class = prompt.texto(
+            "classe de armazenamento (vazio = padrão; ex.: STANDARD_IA)", padrao=destino.storage_class,
+        ).strip().upper()
         destino.access_key = prompt.texto("access key", padrao=destino.access_key, obrigatorio=True)
         segredo = prompt.senha("secret key", manter=bool(destino.secret_enc))
         if segredo:

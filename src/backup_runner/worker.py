@@ -24,10 +24,12 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import archive, destinations, mysql
+from . import archive, destinations, espaco, mysql
 from .config import DestinationStore, JobStore, Settings, decrypt, staging_dir
 from .models import (
     ArchiveFormat,
+    DestKind,
+    FilesMode,
     FilesSource,
     Job,
     ManifestEntry,
@@ -263,6 +265,16 @@ def executa(job: Job, estado: State, *, atrasado: bool = False,
     estado.insert_run(run)
     _avisa_inicio(job, run, atrasado=atrasado)
 
+    if _e_sync(job):
+        # Espelho não produz artefato nem usa staging: vai direto para a raia
+        # de envio, que é onde o trabalho demorado acontece. Assim a primeira
+        # cópia de centenas de gigabytes não segura o dump de outro job.
+        run.result = RunResult.QUEUED
+        run.log.append((inicio.strftime("%H:%M:%S"), "worker", "modo sync: direto para a raia de envio"))
+        estado.update_run(run)
+        estado.enqueue(job.name, run.started_at, kind="envio", run_id=run.id, late=atrasado)
+        return Resultado(run, True, "sync enfileirado")
+
     pasta = staging_dir() / job.name / run.folder
     pasta.mkdir(parents=True, exist_ok=True)
     limite = inicio + dt.timedelta(minutes=job.timeout_minutes)
@@ -284,11 +296,26 @@ def _executa_vigiado(
     prog: Progresso, sentinela: Sentinela, *,
     inicio: dt.datetime, atrasado: bool,
 ) -> Resultado:
+    guarda = espaco.EspacoGuarda.do_staging(pasta)
+
+    def checa() -> None:
+        sentinela()
+        guarda()
+
     try:
-        _produz(job, run, pasta, limite, prog, sentinela)
+        # Antes de escrever um byte: com o disco já no limite, nem começa.
+        guarda.checa()
+        _produz(job, run, pasta, limite, prog, checa)
         _escreve_manifest(run, pasta, sentinela)
     except Cancelado as exc:
         return _cancela(run, estado, pasta, str(exc))
+    except espaco.SemEspaco as exc:
+        run.error_tried = "gerar o artefato no staging"
+        run.error_cause = "o disco do staging chegou no limite configurado"
+        run.error_fix = ("libere espaço, mude staging_path para um volume com folga "
+                         "ou ajuste staging_min_free_gb / staging_max_disk_pct no settings.json")
+        estagio = Stage.DUMP if job.kind is SourceKind.MYSQL else Stage.ARCHIVE
+        return _falha(run, estado, estagio, exc, job, limpa=pasta)
     except mysql.MySQLError as exc:
         return _falha(run, estado, Stage.DUMP, exc, job)
     except archive.ArchiveError as exc:
@@ -739,6 +766,103 @@ def _envia(
     estado.update_run(run)
 
 
+def _e_sync(job: Job) -> bool:
+    return job.kind is SourceKind.FILES and getattr(job.source, "mode", None) is FilesMode.SYNC
+
+
+def _sincroniza(
+    job: Job, run: Run, estado: State, prog: Progresso, sentinela: "Sentinela",
+) -> None:
+    """Modo sync: espelha a pasta em cada destino S3, sem staging."""
+    fonte: FilesSource = job.source  # type: ignore[assignment]
+    destinos = DestinationStore.load()
+
+    for ligacao in job.destinations:
+        destino = destinos.get(ligacao.name)
+        if destino is None or not destino.enabled:
+            run.stages.append(StageRecord(
+                Stage.UPLOAD, StageState.SKIPPED, ligacao.name, "destino ausente ou desativado",
+            ))
+            run.destinations_pending.append(ligacao.name)
+            continue
+        if destino.kind is not DestKind.S3:
+            run.stages.append(StageRecord(
+                Stage.UPLOAD, StageState.FAILED, ligacao.name, "o modo sync só funciona com destino S3",
+            ))
+            run.error_stage = Stage.UPLOAD
+            run.error_cause = f"{ligacao.name} é {destino.kind.value}; o modo sync só funciona com S3"
+            run.error_fix = "troque o destino do job por um S3, ou o modo do job para archive"
+            raise ValueError(run.error_cause)
+
+        inicio = time.monotonic()
+        prog.etapa("comparando", f"{ligacao.name}: {destino.location()}")
+
+        def andamento(feito: int, total: int, rotulo: str) -> None:
+            if prog.stage != "enviando":
+                prog.etapa("enviando", ligacao.name, total=total)
+            prog.anda(feito, total, rotulo)
+
+        try:
+            r = destinations.backend(destino).sync(
+                Path(fonte.path), job.name,
+                excludes=fonte.active_excludes(), follow_links=fonte.follow_links,
+                max_delete_pct=fonte.max_delete_pct,
+                on_progress=andamento, checa=sentinela,
+            )
+        except destinations.SyncRecusado as exc:
+            p = exc.parcial
+            run.bytes = (run.bytes or 0) + p.uploaded_bytes
+            run.error_tried = f"espelhar {fonte.path} em {destino.location()}"
+            run.error_cause = (f"{exc.a_apagar} arquivos sumiram do disco ({100 * exc.a_apagar / exc.total:.1f}% "
+                               f"do backup), acima do limite de {exc.pct}%; nada foi apagado no destino")
+            run.error_fix = ("confira se a remoção foi de propósito; se foi, rode com max_delete_pct maior "
+                             "uma vez; se não foi, restaure do backup antes do próximo sync")
+            raise
+        except TimeoutError:
+            run.error_fix = "rode de novo: o sync continua de onde parou, sem reenviar o que já subiu"
+            raise
+        except Exception as exc:  # noqa: BLE001
+            run.stages.append(StageRecord(
+                Stage.UPLOAD, StageState.FAILED, ligacao.name,
+                destinations._resumo_erro(exc), time.monotonic() - inicio,
+            ))
+            run.destinations_pending.append(ligacao.name)
+            run.error_stage = Stage.UPLOAD
+            run.error_tried = f"espelhar {fonte.path} em {destino.location()}"
+            run.error_got = destinations._resumo_erro(exc)
+            run.error_cause = _causa(destino, exc)
+            run.error_fix = "abra o destino, teste, e use retry quando resolver"
+            continue
+
+        run.bytes = (run.bytes or 0) + r.uploaded_bytes
+        run.artifact = f"espelho de {r.total_files} arquivos, {_tam(r.total_bytes)}"
+        detalhe = (f"{_plural(r.uploaded, 'arquivo')} enviados ({_tam(r.uploaded_bytes)}), "
+                   f"{r.deleted} removidos, {r.unchanged} iguais")
+        for texto in (f"{r.excluded} fora pelas exclusões" if r.excluded else "",
+                      f"{r.unreadable} ilegíveis pulados" if r.unreadable else ""):
+            if texto:
+                run.log.append((relogio.agora().strftime("%H:%M:%S"), ligacao.name, texto))
+        if r.failed:
+            run.stages.append(StageRecord(
+                Stage.UPLOAD, StageState.FAILED, ligacao.name,
+                f"{len(r.failed)} arquivos falharam; {detalhe}", time.monotonic() - inicio,
+            ))
+            for falha in r.failed[:5]:
+                run.log.append((relogio.agora().strftime("%H:%M:%S"), ligacao.name, falha[:200]))
+            run.destinations_pending.append(ligacao.name)
+            run.error_stage = Stage.UPLOAD
+            run.error_cause = f"{len(r.failed)} arquivos não subiram"
+            run.error_fix = "o reenvio automático tenta de novo só o que falta"
+            continue
+
+        run.destinations_done.append(ligacao.name)
+        run.stages.append(StageRecord(
+            Stage.UPLOAD, StageState.DONE, ligacao.name, detalhe, time.monotonic() - inicio,
+        ))
+        run.log.append((relogio.agora().strftime("%H:%M:%S"), ligacao.name, detalhe))
+    estado.update_run(run)
+
+
 def envia_artefato(job: Job, estado: State, item: dict) -> Resultado:
     """A raia de envio: pega o artefato do staging e manda para os destinos.
 
@@ -769,7 +893,7 @@ def envia_artefato(job: Job, estado: State, item: dict) -> Resultado:
         )
 
     pasta = staging_dir() / job.name / run.folder
-    if not pasta.is_dir():
+    if not _e_sync(job) and not pasta.is_dir():
         run.result = RunResult.FAILED
         run.finished_at = run.finished_at or relogio.agora()
         run.error_stage = Stage.UPLOAD
@@ -821,7 +945,10 @@ def _envia_vigiado(
     sentinela: Sentinela, *, atrasado: bool, primeira_vez: bool,
 ) -> Resultado:
     try:
-        _envia(job, run, pasta, estado, prog, sentinela)
+        if _e_sync(job):
+            _sincroniza(job, run, estado, prog, sentinela)
+        else:
+            _envia(job, run, pasta, estado, prog, sentinela)
     except Cancelado as exc:
         return _cancela(run, estado, pasta, str(exc))
     except JobRemovido:
@@ -844,8 +971,11 @@ def _envia_vigiado(
     run.result = RunResult.LATE if atrasado else RunResult.OK
     run.error_stage = None
     run.error_got = run.error_cause = run.error_fix = ""
-    _retencao(job, run)
-    _limpa_staging(job, pasta, run)
+    if not _e_sync(job):
+        # No espelho, o histórico é do versionamento do bucket: não há pasta
+        # datada para a retenção apagar nem staging para limpar.
+        _retencao(job, run)
+        _limpa_staging(job, pasta, run)
     prog.etapa("concluído", run.artifact or "")
     run.log.append((run.finished_at.strftime("%H:%M:%S"), "ok", "execução concluída"))
     estado.update_run(run)

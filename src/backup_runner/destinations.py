@@ -18,6 +18,7 @@ import datetime as dt
 import json
 import os
 import shutil
+import stat
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Protocol
@@ -85,6 +86,32 @@ class RemoteRun:
 def parse_pasta(nome: str) -> dt.datetime | None:
     """A data que está no nome da pasta, que é a idade da execução."""
     return relogio.parse_pasta(nome)
+
+
+@dataclass
+class SyncResult:
+    total_files: int = 0
+    total_bytes: int = 0
+    unchanged: int = 0
+    excluded: int = 0
+    unreadable: int = 0
+    to_upload: int = 0
+    to_upload_bytes: int = 0
+    uploaded: int = 0
+    uploaded_bytes: int = 0
+    deleted: int = 0
+    failed: list[str] = field(default_factory=list)
+
+
+class SyncRecusado(Exception):
+    """O sync ia apagar mais que o limite: nada foi apagado."""
+
+    def __init__(self, a_apagar: int, total: int, pct: int, parcial: SyncResult) -> None:
+        self.a_apagar, self.total, self.pct, self.parcial = a_apagar, total, pct, parcial
+        super().__init__(
+            f"ia apagar {a_apagar} de {total} objetos ({100 * a_apagar / total:.1f}%), "
+            f"acima do limite de {pct}%; nada foi apagado"
+        )
 
 
 class Registro(Protocol):
@@ -321,6 +348,124 @@ class S3Backend:
         partes = [self.destino.prefix.strip("/"), prefixo.strip("/"), nome]
         return "/".join(p for p in partes if p)
 
+    def _extra(self) -> dict:
+        """Argumentos extras de todo objeto gravado: hoje, só a classe."""
+        return {"StorageClass": self.destino.storage_class} if self.destino.storage_class else {}
+
+    # -- espelho (modo sync) -------------------------------------------
+
+    def sync(self, origem: Path, prefixo: str, *, excludes: list[str] | None = None,
+             follow_links: bool = False, max_delete_pct: int = 5,
+             on_progress: Callable[[int, int, str], None] | None = None,
+             checa: Callable[[], None] | None = None, workers: int = 8) -> "SyncResult":
+        """Deixa `<prefixo>/` no bucket igual à pasta `origem`.
+
+        Sobe o arquivo novo ou alterado e apaga o objeto cujo arquivo sumiu. O
+        histórico (versão anterior, objeto apagado) fica com o versionamento do
+        bucket e a regra de ciclo de vida, não aqui.
+
+        "Alterado" é tamanho diferente, ou mtime local mais novo que o
+        LastModified do objeto (a hora em que ele subiu). A listagem já traz os
+        dois, então não há uma requisição por arquivo para comparar: num file
+        manager de 278 mil arquivos, é a diferença entre 280 chamadas e 278 mil.
+
+        Se for apagar mais que `max_delete_pct` dos objetos, não apaga nada e
+        levanta SyncRecusado, depois de subir o que mudou. Apagar em massa é o
+        sintoma de um rm por engano ou de ransomware, e é o tipo de coisa que
+        precisa de gente olhando antes.
+        """
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        from .archive import excluded
+
+        cliente = self.cliente()
+        bucket = self.destino.bucket
+        base = self._chave(prefixo) + "/"
+        checa = checa or (lambda: None)
+
+        remoto: dict[str, tuple[int, float]] = {}
+        for pagina in cliente.get_paginator("list_objects_v2").paginate(Bucket=bucket, Prefix=base):
+            checa()
+            for obj in pagina.get("Contents", []):
+                remoto[obj["Key"][len(base):]] = (obj["Size"], obj["LastModified"].timestamp())
+
+        local: dict[str, tuple[int, float]] = {}
+        ignorados = ilegiveis = 0
+        padroes = list(excludes or [])
+        for raiz, pastas, arquivos in os.walk(origem, followlinks=follow_links):
+            checa()
+            rel_raiz = os.path.relpath(raiz, origem)
+            rel_raiz = "" if rel_raiz == "." else rel_raiz.replace(os.sep, "/")
+            pastas[:] = [p for p in pastas if not excluded(f"{rel_raiz}/{p}".lstrip("/"), p, padroes)]
+            for nome in arquivos:
+                rel = f"{rel_raiz}/{nome}".lstrip("/")
+                if excluded(rel, nome, padroes):
+                    ignorados += 1
+                    continue
+                caminho = os.path.join(raiz, nome)
+                try:
+                    rel.encode("utf-8")
+                    st = os.stat(caminho) if follow_links else os.lstat(caminho)
+                except (OSError, UnicodeEncodeError):
+                    ilegiveis += 1
+                    continue
+                if not stat.S_ISREG(st.st_mode):
+                    continue
+                local[rel] = (st.st_size, st.st_mtime)
+
+        a_enviar = [rel for rel, (tam, mtime) in local.items()
+                    if rel not in remoto or remoto[rel][0] != tam or mtime > remoto[rel][1]]
+        a_apagar = [rel for rel in remoto if rel not in local]
+        total_bytes = sum(local[r][0] for r in a_enviar)
+
+        resultado = SyncResult(
+            total_files=len(local), total_bytes=sum(t for t, _ in local.values()),
+            unchanged=len(local) - len(a_enviar), excluded=ignorados, unreadable=ilegiveis,
+            to_upload=len(a_enviar), to_upload_bytes=total_bytes,
+        )
+
+        def sobe(rel: str) -> int:
+            tamanho = local[rel][0]
+            cliente.upload_file(
+                os.path.join(origem, rel), bucket, base + rel,
+                Config=_transferencia(tamanho), ExtraArgs=self._extra(),
+            )
+            return tamanho
+
+        if on_progress:
+            on_progress(0, total_bytes, f"0 de {len(a_enviar)} arquivos")
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futuros = {pool.submit(sobe, rel): rel for rel in a_enviar}
+            try:
+                for futuro in as_completed(futuros):
+                    try:
+                        resultado.uploaded_bytes += futuro.result()
+                        resultado.uploaded += 1
+                    except Exception as exc:  # noqa: BLE001 - um arquivo não derruba os outros
+                        resultado.failed.append(f"{futuros[futuro]}: {_resumo_erro(exc)}")
+                    if on_progress:
+                        on_progress(resultado.uploaded_bytes, total_bytes,
+                                    f"{resultado.uploaded} de {len(a_enviar)} arquivos")
+                    checa()
+            except BaseException:
+                for f in futuros:
+                    f.cancel()
+                raise
+
+        limite = max(1, len(remoto) * max_delete_pct // 100)
+        if a_apagar and remoto and len(a_apagar) > limite:
+            raise SyncRecusado(len(a_apagar), len(remoto), max_delete_pct, resultado)
+        for i in range(0, len(a_apagar), 1000):
+            checa()
+            lote = a_apagar[i:i + 1000]
+            resposta = cliente.delete_objects(
+                Bucket=bucket, Delete={"Objects": [{"Key": base + r} for r in lote], "Quiet": True},
+            )
+            erros = resposta.get("Errors", [])
+            resultado.failed += [f"{e.get('Key')}: {e.get('Code')}" for e in erros]
+            resultado.deleted += len(lote) - len(erros)
+        return resultado
+
     def test(self) -> TestResult:
         inicio = relogio.agora()
         chave = self._chave("", f".probe-{relogio.agora():%m%d%H%M%S}")
@@ -383,6 +528,7 @@ class S3Backend:
                 cliente.upload_file(
                     str(arquivo), self.destino.bucket, chave,
                     Callback=bloco, Config=_transferencia(tamanho),
+                    ExtraArgs=self._extra(),
                 )
             enviados += tamanho
         return enviados
@@ -424,7 +570,7 @@ class S3Backend:
 
         if upload_id is None:
             upload_id = cliente.create_multipart_upload(
-                Bucket=self.destino.bucket, Key=chave,
+                Bucket=self.destino.bucket, Key=chave, **self._extra(),
             )["UploadId"]
             registro.guarda_upload(nome, chave, upload_id)
 

@@ -65,7 +65,14 @@ def state_file() -> Path:
 
 
 def staging_dir() -> Path:
-    caminho = data_dir() / "staging"
+    """Onde o artefato espera o envio.
+
+    Padrão: dentro do data_dir. `staging_path` no settings.json muda o lugar,
+    para o caso de o disco do sistema estar apertado e haver outro volume com
+    folga (o servidor da Peer Saúde, por exemplo).
+    """
+    configurado = _read_json(settings_file()).get("staging_path") or ""
+    caminho = Path(configurado).expanduser() if configurado else data_dir() / "staging"
     caminho.mkdir(parents=True, exist_ok=True)
     return caminho
 
@@ -252,7 +259,13 @@ class Settings:
         self.notify_global = NotifyMatrix.from_dict(d.get("notify_global")) if d.get("notify_global") else NotifyMatrix.default_global()
         self.smtp: dict[str, Any] = d.get("smtp") or {}
         self.slack: dict[str, Any] = d.get("slack") or {}
-        self.staging_cap_gb: int = int(d.get("staging_cap_gb", 20) or 20)
+        # Pasta do staging; vazio usa data_dir/staging (ver staging_dir()).
+        self.staging_path: str = d.get("staging_path", "") or ""
+        # O worker recusa começar, e interrompe no meio, se o disco do staging
+        # ficar com menos que isto livre ou mais que esta porcentagem usada.
+        # Encher o disco no meio da madrugada derruba o resto do servidor.
+        self.staging_min_free_gb: int = int(d.get("staging_min_free_gb", 5) or 5)
+        self.staging_max_disk_pct: int = int(d.get("staging_max_disk_pct", 90) or 90)
         self.staging_hold_hours: int = int(d.get("staging_hold_hours", 72) or 72)
         self.history_days: int = int(d.get("history_days", 90) or 90)
         self.locale: str | None = d.get("locale")
@@ -268,7 +281,9 @@ class Settings:
             "notify_global": self.notify_global.to_dict(),
             "smtp": self.smtp,
             "slack": self.slack,
-            "staging_cap_gb": self.staging_cap_gb,
+            "staging_path": self.staging_path,
+            "staging_min_free_gb": self.staging_min_free_gb,
+            "staging_max_disk_pct": self.staging_max_disk_pct,
             "staging_hold_hours": self.staging_hold_hours,
             "history_days": self.history_days,
             "locale": self.locale,

@@ -168,12 +168,26 @@ class ExcludePattern:
     enabled: bool = True
 
 
+class FilesMode(str, Enum):
+    # Um .tar.gz por execução, numa pasta datada; a retenção apaga as velhas.
+    ARCHIVE = "archive"
+    # Espelho no destino: sobe só o que mudou e apaga o que sumiu do disco. O
+    # histórico fica no versionamento do bucket. Só para S3, e sem staging, o
+    # que é o que permite copiar centenas de gigabytes num disco quase cheio.
+    SYNC = "sync"
+
+
 @dataclass
 class FilesSource:
     path: str = ""
     excludes: list[ExcludePattern] = field(default_factory=list)
     follow_links: bool = False
     archive_format: ArchiveFormat = ArchiveFormat.TARGZ
+    mode: FilesMode = FilesMode.ARCHIVE
+    # No modo sync, a execução para sem apagar nada se for remover mais que
+    # esta porcentagem dos arquivos do destino: um rm -rf por engano, ou um
+    # ransomware, não esvazia o backup sem ninguém ver.
+    max_delete_pct: int = 5
 
     kind = SourceKind.FILES
 
@@ -190,6 +204,8 @@ class FilesSource:
             "excludes": [{"pattern": e.pattern, "enabled": e.enabled} for e in self.excludes],
             "follow_links": self.follow_links,
             "format": self.archive_format.value,
+            "mode": self.mode.value,
+            "max_delete_pct": self.max_delete_pct,
         }
 
     @classmethod
@@ -202,6 +218,8 @@ class FilesSource:
             ],
             follow_links=bool(d.get("follow_links", False)),
             archive_format=ArchiveFormat(d.get("format", ArchiveFormat.TARGZ.value)),
+            mode=FilesMode(d.get("mode", FilesMode.ARCHIVE.value)),
+            max_delete_pct=int(d.get("max_delete_pct", 5) if d.get("max_delete_pct") is not None else 5),
         )
 
 
@@ -237,6 +255,10 @@ class Destination:
     prefix: str = ""
     access_key: str = ""
     secret_enc: str | None = None
+    # Classe de armazenamento dos objetos (STANDARD, STANDARD_IA, ...). Vazio é
+    # o padrão do provedor. Backup quase nunca é lido, e STANDARD_IA custa
+    # metade, mas cobra 30 dias mínimos e 128 KB mínimos por objeto.
+    storage_class: str = ""
     # sftp
     host: str = ""
     port: int = 22
@@ -273,6 +295,7 @@ class Destination:
             d.update(
                 endpoint=self.endpoint, region=self.region, bucket=self.bucket,
                 prefix=self.prefix, access_key=self.access_key, secret_enc=self.secret_enc,
+                storage_class=self.storage_class,
             )
         else:
             d.update(
@@ -298,6 +321,7 @@ class Destination:
             prefix=d.get("prefix", ""),
             access_key=d.get("access_key", ""),
             secret_enc=d.get("secret_enc"),
+            storage_class=d.get("storage_class", "") or "",
             host=d.get("host", ""),
             port=int(d.get("port", 22) or 22),
             user=d.get("user", ""),

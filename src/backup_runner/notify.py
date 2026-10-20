@@ -23,7 +23,7 @@ from email.message import EmailMessage
 from . import __version__, relogio
 from .config import Settings, decrypt
 from .format import format_bytes, format_duration
-from .models import Channel, Job, NotifyEvent, Run, RunResult
+from .models import Channel, FilesMode, Job, NotifyEvent, Run, RunResult
 from .schedule import humanize
 
 
@@ -251,7 +251,10 @@ def _cartao_execucao(job: Job, run: Run, evento: NotifyEvent) -> dict:
     if run.destinations_pending:
         campos.append(("Pendente", _esc(", ".join(run.destinations_pending))))
     if evento in (NotifyEvent.SUCCESS, NotifyEvent.RECOVERED):
-        campos.append(("Pasta", f"`{run.folder}`"))
+        if getattr(job.source, "mode", None) is FilesMode.SYNC:
+            campos.append(("Espelho", _esc(run.artifact or "")))
+        else:
+            campos.append(("Pasta", f"`{run.folder}`"))
     if evento is NotifyEvent.MISSED and run.error_cause:
         campos.append(("Motivo", _esc(run.error_cause)))
 
