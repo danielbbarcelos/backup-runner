@@ -86,23 +86,21 @@ NOTIFY_EVENTS = [
 CHANNELS = [Channel.EMAIL, Channel.SLACK]
 
 
-# Padrão herdado do mysql-dumper: tabelas que terminam em _YYYYMM, com ou sem
-# sufixo de versão. Reavaliado a cada execução, então tabela mensal nova já
-# nasce ignorada.
+# Padrão de fábrica: as tabelas do Laravel Telescope e do Laravel Pulse, dados
+# de depuração e métrica que crescem muito (13 GB no banco de logs da Peer
+# Saúde) e nunca são restaurados. A estrutura delas continua no dump.
 #
-# Também nascem ignoradas as tabelas do Laravel Telescope e do Laravel Pulse:
-# são dados de depuração e métrica, que crescem muito (13 GB no banco de logs
-# da Peer Saúde) e nunca são restaurados. A estrutura delas continua no dump.
-DEFAULT_IGNORE_REGEX = (
-    r"_[0-9]{6}$|_(19|20)[0-9]{2}(0[1-9]|1[0-2])(_v[0-9]+)?$"
-    r"|^telescope_|^pulse_"
-)
+# Até a 0.8.1 o padrão também ignorava as tabelas mensais (_YYYYMM), herança
+# do mysql-dumper. Saiu na 0.8.2: no banco de logs da Peer Saúde isso deixava
+# de fora a tabela do mês corrente, onde a aplicação ainda grava.
+DEFAULT_IGNORE_REGEX = r"^telescope_|^pulse_"
 
 # Padrões de fábrica de versões anteriores. Um job gravado com um deles nunca
 # foi personalizado, então ganha o padrão atual ao ser lido; job com regex
 # própria fica como está.
 LEGACY_IGNORE_REGEXES = {
     r"_[0-9]{6}$|_(19|20)[0-9]{2}(0[1-9]|1[0-2])(_v[0-9]+)?$",
+    r"_[0-9]{6}$|_(19|20)[0-9]{2}(0[1-9]|1[0-2])(_v[0-9]+)?$|^telescope_|^pulse_",
 }
 
 

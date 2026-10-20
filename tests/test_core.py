@@ -73,7 +73,7 @@ def test_cron_dia_ou_semana():
 # ----------------------------------------------------------------------------
 
 def test_regex_reavaliada_pega_tabela_nova():
-    """O ponto do padrão: tabela mensal criada depois do cadastro já nasce ignorada."""
+    """Regex reavaliada a cada execução: tabela criada depois do cadastro já nasce ignorada."""
     from backup_runner.models import MySQLSource
 
     fonte = MySQLSource(ignore_regex=r"_[0-9]{6}$")
@@ -105,17 +105,19 @@ def test_padrao_ignora_telescope_e_pulse_e_nada_parecido():
     fonte = MySQLSource(database="x")
     tabelas = ["telescope_entries", "telescope_entries_tags", "telescope_monitoring",
                "pulse_entries", "pulse_aggregates", "pulse_values",
-               "telescopes", "my_pulse_entries", "clientes", "pedidos_202609"]
+               "telescopes", "my_pulse_entries", "clientes", "logs_202610"]
     por_regex, _ = fonte.resolve_ignored(tabelas)
+    # Tabela mensal entra com dados desde a 0.8.2.
     assert por_regex == sorted(["telescope_entries", "telescope_entries_tags", "telescope_monitoring",
-                                "pulse_entries", "pulse_aggregates", "pulse_values", "pedidos_202609"])
+                                "pulse_entries", "pulse_aggregates", "pulse_values"])
 
 
 def test_job_com_o_padrao_antigo_ganha_o_novo_e_o_personalizado_fica():
     from backup_runner.models import DEFAULT_IGNORE_REGEX, MySQLSource
 
-    antigo = r"_[0-9]{6}$|_(19|20)[0-9]{2}(0[1-9]|1[0-2])(_v[0-9]+)?$"
-    assert MySQLSource.from_dict({"ignore_regex": antigo}).ignore_regex == DEFAULT_IGNORE_REGEX
+    for antigo in (r"_[0-9]{6}$|_(19|20)[0-9]{2}(0[1-9]|1[0-2])(_v[0-9]+)?$",
+                   r"_[0-9]{6}$|_(19|20)[0-9]{2}(0[1-9]|1[0-2])(_v[0-9]+)?$|^telescope_|^pulse_"):
+        assert MySQLSource.from_dict({"ignore_regex": antigo}).ignore_regex == DEFAULT_IGNORE_REGEX
     assert MySQLSource.from_dict({"ignore_regex": r"_log$"}).ignore_regex == r"_log$"
     assert MySQLSource.from_dict({"ignore_regex": ""}).ignore_regex == ""
 

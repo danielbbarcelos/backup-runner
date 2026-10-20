@@ -188,11 +188,9 @@ nunca tocando em execução viva nem em envio pendente.
 ### Tabelas ignoradas
 
 Tabela ignorada sai no dump só com a estrutura, sem os dados. O padrão de um
-job novo ignora:
-
-- tabelas mensais, que terminam em `_YYYYMM` (com ou sem sufixo `_v2`);
-- as do Laravel Telescope (`telescope_*`) e do Laravel Pulse (`pulse_*`), dados
-  de depuração e métrica que crescem muito e nunca são restaurados.
+job novo ignora as tabelas do Laravel Telescope (`telescope_*`) e do Laravel
+Pulse (`pulse_*`), dados de depuração e métrica que crescem muito e nunca são
+restaurados. Tabela mensal (`_YYYYMM`) entra com os dados desde a 0.8.2.
 
 A regex é reavaliada a cada execução, então tabela nova que casa já nasce
 ignorada. Job ainda com o padrão de fábrica de uma versão anterior passa para o
