@@ -436,8 +436,8 @@ def test_retencao_do_job_sobrescreve_a_do_destino():
 # Avisos
 # ----------------------------------------------------------------------------
 
-def test_padrao_global_nao_avisa_sucesso():
-    """Silêncio precisa significar sucesso, senão o alerta vira ruído."""
+def test_padrao_global_nao_avisa_sucesso_por_email():
+    """No e-mail, silêncio significa sucesso; o Slack é o canal de acompanhar."""
     from backup_runner.models import Channel, NotifyEvent, NotifyMatrix
 
     padrao = NotifyMatrix.default_global()

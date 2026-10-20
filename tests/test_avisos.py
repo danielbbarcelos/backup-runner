@@ -79,11 +79,14 @@ def _texto(payload: dict) -> str:
     return json.dumps(payload, ensure_ascii=False)
 
 
-def test_inicio_nao_avisa_no_padrao_de_fabrica(slack):
-    from backup_runner import notify
+def test_slack_avisa_inicio_e_sucesso_no_padrao_de_fabrica_e_email_nao():
+    from backup_runner.models import Channel, NotifyEvent, NotifyMatrix
 
-    notify.sobre_inicio(_job(), _run())
-    assert slack == []
+    padrao = NotifyMatrix.default_global()
+    for evento in (NotifyEvent.START, NotifyEvent.SUCCESS, NotifyEvent.FAILURE):
+        assert padrao.get(evento, Channel.SLACK) is True
+    assert padrao.get(NotifyEvent.START, Channel.EMAIL) is False
+    assert padrao.get(NotifyEvent.SUCCESS, Channel.EMAIL) is False
 
 
 def test_inicio_ligado_sai_com_play_e_barra_azul(slack):

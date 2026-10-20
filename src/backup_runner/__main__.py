@@ -23,6 +23,7 @@ pelo menu: tudo é scriptável, e a saída é texto que `grep` filtra.
 from __future__ import annotations
 
 import argparse
+from pathlib import Path
 import datetime as dt
 import sys
 
@@ -781,6 +782,12 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--editar", action="store_true", help="mudar, em vez de só mostrar")
     s.set_defaults(func=cmd_notify)
 
+    s = sub.add_parser("apply", help="aplica um arquivo YAML com destinos, jobs, Slack e staging")
+    s.add_argument("arquivo")
+    s.add_argument("--dry-run", action="store_true", help="só mostra o que mudaria")
+    s.add_argument("--prune", action="store_true", help="remove os jobs que não estão no arquivo")
+    s.set_defaults(func=cmd_apply)
+
     s = sub.add_parser("health", help="diagnóstico do sistema")
     s.set_defaults(func=cmd_health)
 
@@ -832,6 +839,25 @@ def build_parser() -> argparse.ArgumentParser:
     s.set_defaults(func=cmd_self)
 
     return p
+
+
+def cmd_apply(args: argparse.Namespace) -> int:
+    from . import aplica
+
+    try:
+        plano = aplica.planeja(aplica.carrega(Path(args.arquivo)), prune=args.prune)
+    except aplica.ApplyError as exc:
+        c.erro(str(exc))
+        return 2
+    simbolos = {"criar": "+", "alterar": "~", "alterar segredo": "~", "remover": "-", "igual": " "}
+    for acao, tipo, nome in plano.linhas:
+        print(f"  {simbolos[acao]} {tipo:8} {nome:30} {acao}")
+    if args.dry_run:
+        c.nota(f"{plano.mudancas} mudanças; nada foi gravado (--dry-run)")
+        return 0
+    aplica.aplica(plano)
+    c.sucesso(f"aplicado: {plano.mudancas} mudanças")
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:

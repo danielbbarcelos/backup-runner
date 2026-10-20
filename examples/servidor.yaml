@@ -1,0 +1,45 @@
+# Exemplo de `backup-runner apply examples/servidor.yaml`.
+#
+# Segredo nunca entra aqui: senha e chave vêm de {env: NOME}, de
+# {dotenv: caminho, key: NOME} ou de {file: caminho}, lidos na hora do apply.
+#
+#   export BR_S3_ACCESS_KEY=... BR_S3_SECRET_KEY=... BR_SLACK_WEBHOOK=...
+#   backup-runner apply servidor.yaml --dry-run   # mostra o que mudaria
+#   backup-runner apply servidor.yaml             # aplica
+#   backup-runner tick --install                  # uma vez por servidor
+#   backup-runner install --gerenciador supervisord
+
+timezone: America/Sao_Paulo
+
+# Opcional: staging em outro volume, quando o disco do sistema está apertado.
+# staging_path: /mnt/volume/backup-runner-staging
+
+slack:
+  webhook: {env: BR_SLACK_WEBHOOK}
+
+# Convenção: cria s3-<project> (prefixo mysql/, dumps com retenção de 30 dias)
+# e s3-<project>-sync (prefixo sync/, Standard-IA, espelho de arquivos). O
+# bucket padrão é backup-runner-<project>; o histórico do espelho depende do
+# versionamento e do ciclo de vida do bucket.
+s3:
+  project: exemplo
+  region: us-east-2
+  access_key: {env: BR_S3_ACCESS_KEY}
+  secret_key: {env: BR_S3_SECRET_KEY}
+
+jobs:
+  exemplo-app:
+    mysql:
+      database: exemplo_prod
+      user: root
+      password: {dotenv: /var/www/exemplo/.env, key: DB_PASSWORD}
+      # O padrão já ignora os dados de telescope_* e pulse_*.
+      # ignore: [tabela_grande]
+    schedule: "0 3 * * *"
+
+  exemplo-files:
+    sync:
+      path: /var/www/exemplo/storage/app
+      exclude: ["*.tmp", "cache/**"]
+    schedule: "30 3 * * *"
+    timeout_minutes: 1440   # a primeira cópia de uma pasta grande leva horas

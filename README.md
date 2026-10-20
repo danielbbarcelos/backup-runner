@@ -381,6 +381,22 @@ que mudou, não apaga nada e falha com aviso: remoção em massa é o sintoma de
 uma primeira cópia de horas não segura o dump de outro job. A execução que passa
 do tempo limite continua de onde parou na próxima.
 
+### Configurar por arquivo
+
+`backup-runner apply servidor.yaml` cria ou atualiza destinos, jobs, Slack e
+staging a partir de um YAML, e `--dry-run` mostra antes o que mudaria. Rodar de
+novo não muda nada; o histórico e os avisos de cada job são preservados.
+`--prune` remove os jobs que saíram do arquivo.
+
+Segredo não entra no arquivo: senha e chave vêm de `{env: NOME}`,
+`{dotenv: caminho, key: NOME}` (o `.env` da aplicação) ou `{file: caminho}`. O
+bloco `s3:` aplica a convenção de dois destinos num bucket (dumps em `mysql/`,
+espelho em `sync/` com Standard-IA) e liga cada job ao destino certo. Exemplo
+completo em [examples/servidor.yaml](examples/servidor.yaml).
+
+No Slack, o padrão avisa tudo, inclusive início e sucesso; no e-mail, só o que
+pede ação.
+
 ### Espaço no staging
 
 O worker confere o disco do staging antes de gerar o artefato e de novo durante

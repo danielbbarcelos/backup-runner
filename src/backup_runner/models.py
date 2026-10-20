@@ -411,14 +411,17 @@ class NotifyMatrix:
     def default_global(cls) -> "NotifyMatrix":
         """Padrão de fábrica: silêncio significa sucesso.
 
-        Início e sucesso não avisam. Falha, recuperação, janela perdida e
-        silêncio longo avisam nos dois canais.
+        No Slack tudo avisa, inclusive início e sucesso: é o canal de
+        acompanhar, e ver o ✅ toda madrugada é a confirmação de que rodou. No
+        e-mail, só o que pede ação (falha, recuperação, janela perdida e
+        silêncio longo): caixa de entrada cheia de "deu certo" vira ruído e a
+        falha passa despercebida.
         """
         m = cls()
-        quietos = (NotifyEvent.START, NotifyEvent.SUCCESS)
+        quietos_email = (NotifyEvent.START, NotifyEvent.SUCCESS)
         for evento in NOTIFY_EVENTS:
-            for canal in CHANNELS:
-                m.set(evento, canal, evento not in quietos)
+            m.set(evento, Channel.SLACK, True)
+            m.set(evento, Channel.EMAIL, evento not in quietos_email)
         return m
 
 
