@@ -69,6 +69,20 @@ def test_cria_destinos_da_convencao_jobs_slack_e_staging(envfile, tmp_path):
     assert s.channel_configured("slack") and staging_dir() == tmp_path / "staging"
 
 
+def test_classe_dos_dumps_e_opcional_e_aparece_no_plano(envfile, tmp_path):
+    aplica.aplica(aplica.planeja(config(envfile, tmp_path)))
+    assert DestinationStore.load().get("s3-peersaude").storage_class == ""
+
+    c = config(envfile, tmp_path)
+    c["s3"]["mysql_storage_class"] = "STANDARD_IA"
+    plano = aplica.planeja(c)
+    assert plano.mudancas == 1, plano.linhas
+    aplica.aplica(plano)
+    d = DestinationStore.load()
+    assert d.get("s3-peersaude").storage_class == "STANDARD_IA"
+    assert d.get("s3-peersaude-sync").storage_class == "STANDARD_IA"
+
+
 def test_aplicar_de_novo_nao_muda_nada(envfile, tmp_path):
     aplica.aplica(aplica.planeja(config(envfile, tmp_path)))
     plano = aplica.planeja(config(envfile, tmp_path))

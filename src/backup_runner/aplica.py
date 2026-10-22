@@ -106,7 +106,10 @@ def _destinos_s3(cfg: dict) -> dict[str, Destination]:
         retention_days=int(cfg.get("retention_days", 30)),
     )
     return {
-        f"s3-{projeto}": Destination(name=f"s3-{projeto}", prefix="mysql", **base),
+        f"s3-{projeto}": Destination(
+            name=f"s3-{projeto}", prefix="mysql",
+            storage_class=cfg.get("mysql_storage_class", ""), **base,
+        ),
         f"s3-{projeto}-sync": Destination(
             name=f"s3-{projeto}-sync", prefix="sync",
             storage_class=cfg.get("sync_storage_class", "STANDARD_IA"), **base,

@@ -26,6 +26,10 @@ s3:
   region: us-east-2
   access_key: {env: BR_S3_ACCESS_KEY}
   secret_key: {env: BR_S3_SECRET_KEY}
+  # Opcional: classe dos dumps (padrão Standard). STANDARD_IA compensa quando
+  # o dump é grande e fica os 30 dias inteiros; o espelho já é Standard-IA
+  # (sync_storage_class).
+  # mysql_storage_class: STANDARD_IA
 
 jobs:
   exemplo-app:
